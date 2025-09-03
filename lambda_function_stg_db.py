@@ -41,8 +41,20 @@ async def async_stg_to_db_handler(event, context=None):
     Process staging tables to final database tables in the correct order.
     """
     start_time = time.time()
-    account_id = event.get('account_id', 85)
-    location_id = event.get('location_id', 48718)
+    account_id = event.get('account_id')
+    location_id = event.get('location_id')
+    if(account_id is None):
+        logger.error("account_id is required")
+        return {
+            'status': 'error',
+            'error': 'account_id is required'
+        }
+    if(location_id is None):
+        logger.error("location_id is required")
+        return {
+            'status': 'error',
+            'error': 'location_id is required'
+        }
 
     # Create database engine
     engine = create_engine(settings.DATABASE_URL)

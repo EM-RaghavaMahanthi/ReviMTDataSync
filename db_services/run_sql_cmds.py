@@ -7,10 +7,10 @@ DB_CONNECTION_STRING = settings.DATABASE_URL
 SQL_FOLDER = os.path.join(os.path.dirname(__file__), '../sql_cmds')
 
 SQL_FILES_ORDER = [
-    #'customers.sql',
-    #'membership_instances.sql',
-    #'class_sessions.sql',
-    #'credit_transactions.sql',
+    # 'customers.sql',
+    # 'membership_instances.sql',
+    # 'class_sessions.sql',
+    # 'credit_transactions.sql',
     # 'membership_transactions.sql',
     # 'orders.sql',
     # 'reservations.sql',

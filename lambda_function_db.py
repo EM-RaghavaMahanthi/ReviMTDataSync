@@ -1,7 +1,6 @@
 import sys
 import logging
 from db_services.main_bulk_insert_service import etl_all_tables
-from db_services.run_sql_cmds import run_sql_files_in_order
 from core.config import settings
 from sqlalchemy import create_engine
 
@@ -9,16 +8,27 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lambda_function_db")
 
 def lambda_handler(event, context=None):
-    account_id = event.get('account_id', 89)
-    location_id = event.get('location_id', 48717)
+    import awswrangler as wr
+    account_id = event.get('account_id')
+    location_id = event.get('location_id')
+    if(account_id is None):
+        logger.error("account_id is required")
+        return {
+            'status': 'error',
+            'error': 'account_id is required'
+        }
+    if(location_id is None):
+        logger.error("location_id is required")
+        return {
+            'status': 'error',
+            'error': 'location_id is required'
+        }
     bucket = settings.S3_BUCKET
     engine = create_engine(settings.DATABASE_URL)
     try:
-        logger.info(f"Starting ETL for account_id={account_id}, location_id={location_id}")
-        #etl_all_tables(bucket, account_id , engine)
-        logger.info("ETL completed. Running post-load SQL commands...")
-        #run_sql_files_in_order(account_id, location_id)
-        logger.info("Post-load SQL commands completed.")
+        logger.info(f"Starting ETL stage 2 for account_id={account_id}, location_id={location_id}")
+        etl_all_tables(bucket, account_id , engine)
+        logger.info("ETL stage 2 completed: Loaded all tables as staged")
         return {
             'status': 'success',
             'account_id': account_id,

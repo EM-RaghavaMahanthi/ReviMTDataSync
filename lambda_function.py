@@ -222,7 +222,7 @@ async def async_lambda_handler(event, context):
             batch_size = getattr(settings, "API_BATCH_SIZE", 1000)
             user_ids = event.get("user_ids")
             batch_id = event.get("batch_id", 1)
-            account_id = event.get("account_id")  # Make sure account_id is in event or context
+            account_id = event.get("account_id")  
             api_base_url = event.get("api_base_url")
             
             if user_ids:
@@ -609,8 +609,15 @@ async def async_lambda_handler(event, context):
             }
         total_records = sum(r.get("records", 0) for r in results if r.get("status") == "success")
         total_expected = sum(r.get("expected", r.get("records", 0)) for r in results if r.get("status") == "success")
-        if total_expected is not None and total_records != total_expected:
-            logger.warning(f"[lambda_handler] {resource.title()}: Expected {total_expected} records, but only {total_records} written to S3. Missing: {total_expected - total_records}")
+
+        if total_expected is not None and total_records < total_expected:
+            missing_records = total_expected - total_records
+            error_msg = f"{resource.title()} data inconsistency for account_id={account_id}: Expected {total_expected} records, but only {total_records} written to S3. Missing: {missing_records}"
+            logger.error(f"[lambda_handler] {error_msg}")
+            raise Exception(error_msg)
+        else:
+            logger.info(f"[lambda_handler] {resource.title()} FULL SUCCESS for account_id={account_id}: All expected records processed successfully. Total: {total_records}")
+
 
         elapsed = time.time() - start_time
         if resource == "reservations":
