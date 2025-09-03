@@ -18,3 +18,22 @@
 
 # Don't ignore .gitignore itself
 !.gitignore
+
+
+!core/**
+!data/**
+!db/**
+!models/**
+!schemas/**
+!services/**
+!db_services/**
+!utils/**
+!stg_db_services/**
+
+
+
+**/__pycache__/
+**/*.py[cod]
+**/*.pyo
+**/*.pyd
+.Python
