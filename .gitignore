@@ -1,0 +1,20 @@
+# Ignore everything
+*
+
+# Except these directories
+!core/
+!data/
+!db/
+!models/
+!schemas/
+!services/
+!db_services/
+!utils/
+!stg_db_services/
+
+# Except these files
+!lambda_function*.py
+!uv_requirements.txt
+
+# Don't ignore .gitignore itself
+!.gitignore
