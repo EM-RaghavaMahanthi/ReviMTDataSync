@@ -1196,11 +1196,12 @@ class CreditTransactionOrder(BaseModel):
     transaction_date: Optional[datetime] = None
     credit_name: Optional[str] = None
     is_expired: Optional[bool] = None
+    remaining_credits_cache: Optional[int] = None 
     is_intro_offer: Optional[bool] = None
     parent_credit_transaction_type: Optional[str] = None
     parent_credit_transaction_id: Optional[int] = None
-    customer_id: Optional[str] = None   # External string key for CRM (if stored)
-    customer_ref_id: Optional[int] = None   # DB FK reference
+    customer_id: Optional[str] = None   
+    customer_ref_id: Optional[int] = None   
     location: Optional[int] = None
     created_at: Optional[datetime] = None
     created_by: Optional[int] = None
@@ -1430,6 +1431,7 @@ class MembershipTransaction(BaseModel):
     customer_id: Optional[str] = None
     account_id: Optional[int] = None
     location: Optional[int] = None
+    payment_interval_end_date: Optional[datetime] = None
     created_at: Optional[datetime] = None  
     created_by: Optional[int] = None
     updated_at: Optional[datetime] = None 

@@ -22,6 +22,58 @@ from stg_db_services.reservations_service_08 import process_reservations
 
 logger = logging.getLogger("lambda_function_stg_db")
 
+async def post_processing_step(account_id: int, is_post_process=False):
+
+
+    """
+    Post-processing step that calls an endpoint after all tables are successfully processed.
+    Uses Auth0 authentication and analytics API client.
+    Only called if all table processing succeeds.
+    
+    Args:
+        account_id: The account ID to send to the post-processing endpoint
+        
+    Returns:
+        bool: True if post-processing succeeded, False otherwise
+    """
+
+    if(not is_post_process):
+        logger.info(f"🚀 Skipping post-processing step for account_id={account_id}")
+        return True  # Skip post-processing if flag not set
+
+    logger.info(f"🚀 Starting post-processing step for account_id={account_id}")
+    
+    try:
+        # Import the clients
+        from clients.auth_client import Auth0Client
+        from clients.api_client import AnalyticsAPIClient
+        
+        # Get authentication token
+        logger.info("🔐 Getting authentication token...")
+        async with Auth0Client() as auth_client:
+            access_token = await auth_client.get_access_token()
+        
+        # Call post-processing endpoint
+        logger.info("📤 Calling post-processing endpoint...")
+        async with AnalyticsAPIClient() as api_client:
+            # TODO: Replace 'post-process' with your actual endpoint path
+            endpoint = f"eztexting/sync-with-eztexting"  
+
+            response_data = None
+
+            response_data = await api_client.post_endpoint(
+                endpoint=endpoint,
+                account_id=str(account_id),
+                access_token=access_token
+            )
+            
+            logger.info(f"✅ Post-processing completed successfully: {response_data}")
+            return True
+                    
+    except Exception as e:
+        logger.error(f"💥 Post-processing failed: {e}")
+        return False
+
 # Define the processing order and service functions
 PROCESSING_ORDER = [
     ("customers_01", process_customers),
@@ -127,22 +179,71 @@ async def async_stg_to_db_handler(event, context=None):
         if failed_tables:
             logger.error(f"   ❌ Failed: {[t['table'] for t in failed_tables]}")
         
-        # Determine overall status
-        overall_status = "success" if failure_count == 0 else "partial_success" if success_count > 0 else "failed"
-        
-        return {
-            'status': overall_status,
-            'account_id': account_id,
-            'location_id': location_id,
-            'summary': {
-                'total_tables': total_tables,
-                'successful_tables': success_count,
-                'failed_tables': failure_count,
-                'total_records_processed': total_processed,
-                'total_duration_seconds': total_duration
-            },
-            'table_results': successful_tables + failed_tables
-        }
+        # Determine overall status - STRICT: Any failure means overall failure
+        if failure_count > 0:
+            overall_status = "failed"
+            error_message = f"Processing failed: {failure_count} out of {total_tables} tables failed"
+            logger.error(f"🚨 STRICT MODE: {error_message}")
+            
+            return {
+                'status': 'error',
+                'account_id': account_id,
+                'location_id': location_id,
+                'error': error_message,
+                'post_process_successful': False,  # Not attempted due to table failures
+                'summary': {
+                    'total_tables': total_tables,
+                    'successful_tables': success_count,
+                    'failed_tables': failure_count,
+                    'total_records_processed': total_processed,
+                    'total_duration_seconds': total_duration
+                },
+                'table_results': successful_tables + failed_tables
+            }
+        else:
+            # All tables succeeded - proceed with post-processing
+            logger.info("🎯 All tables processed successfully, starting post-processing step")
+            post_process_successful = await post_processing_step(account_id, False)
+
+            if post_process_successful:
+                overall_status = "success"
+                logger.info("🎉 Post-processing completed successfully - full pipeline success!")
+            else:
+                overall_status = "failed"
+                error_message = "Table processing succeeded but post-processing failed"
+                logger.error(f"🚨 {error_message}")
+                
+                return {
+                    'status': 'error',
+                    'account_id': account_id,
+                    'location_id': location_id,
+                    'error': error_message,
+                    'post_process_successful': False,
+                    'summary': {
+                        'total_tables': total_tables,
+                        'successful_tables': success_count,
+                        'failed_tables': failure_count,
+                        'total_records_processed': total_processed,
+                        'total_duration_seconds': total_duration
+                    },
+                    'table_results': successful_tables + failed_tables
+                }
+            
+            return {
+                'status': overall_status,
+                'account_id': account_id,
+                'location_id': location_id,
+                'is_post_process': False,
+                'post_process_successful': post_process_successful,
+                'summary': {
+                    'total_tables': total_tables,
+                    'successful_tables': success_count,
+                    'failed_tables': failure_count,
+                    'total_records_processed': total_processed,
+                    'total_duration_seconds': total_duration
+                },
+                'table_results': successful_tables + failed_tables
+            }
         
     except Exception as e:
         end_time = time.time()
@@ -176,8 +277,8 @@ if __name__ == "__main__":
     
     if result['status'] == 'success':
         print("🎉 All staging-to-DB processing completed successfully!")
-    elif result['status'] == 'partial_success':
-        print("⚠️  Staging-to-DB processing completed with some failures.")
     else:
         print("❌ Staging-to-DB processing failed.")
+        if 'error' in result:
+            print(f"Error: {result['error']}")
         sys.exit(1)

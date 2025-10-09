@@ -456,12 +456,12 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
             
             logger.info(f"[process_membership_transactions] SUCCESS: Validation passed - {insert_ready_count} records ready for insertion as expected")
             
-            # # Step 7: Insert valid records (commented out for now)
-            # try:
-            #     inserted_records = await step_7_insert_valid_records(account_id, location_id, engine)
-            # except Exception as e:
-            #     logger.error(f"[process_membership_transactions] ERROR: Step 7 failed: {e}")
-            #     raise
+            # Step 7: Insert valid records (commented out for now)
+            try:
+                inserted_records = await step_7_insert_valid_records(account_id, location_id, engine)
+            except Exception as e:
+                logger.error(f"[process_membership_transactions] ERROR: Step 7 failed: {e}")
+                raise
         else:
             logger.warning(f"[process_membership_transactions] WARNING: No records to insert (expected_ready: {expected_ready})")
             insert_ready_count = 0

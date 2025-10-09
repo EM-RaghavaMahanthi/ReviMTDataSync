@@ -18,12 +18,46 @@ async def fetch_customers_page(location_id: str, page: int, account_id: str, api
     params = {"home_location": location_id, "page": page, "page_size": page_size}
     logger.info(f"[FETCH] Location {location_id}, Account {account_id}: Fetching page {page} with page_size {page_size}")
     resp = await api_get("/users", api_base_url, params)
-    from schemas.revi_schema import Customer
+    from schemas.revi_schema import Customer  # Updated import
     valid_customers = []
     for u in resp.get("data", []):
-        raw = dict({"customer_id": u["id"]}, **u["attributes"])
-        raw['location_id'] = location_id
-        raw['account_id'] = account_id
+        attributes = u.get("attributes", {})
+        relationships = u.get("relationships", {})
+        
+        # Extract home_location_id from relationships if available
+        home_location_data = relationships.get("home_location", {}).get("data")
+        home_location_id = home_location_data.get("id") if home_location_data else None
+        
+        raw = {
+            "customer_id": str(u.get("id")),
+            "location_id": str(location_id),
+            "account_id": account_id,
+            "first_name": attributes.get("first_name"),
+            "last_name": attributes.get("last_name"),
+            "email": attributes.get("email"),
+            "full_name": attributes.get("full_name"),
+            "birth_date": attributes.get("birth_date"),
+            "phone_number": attributes.get("phone_number"),
+            "address_line1": attributes.get("address_line1"),
+            "address_line2": attributes.get("address_line2"),
+            "address_line3": attributes.get("address_line3"),
+            "city": attributes.get("city"),
+            "country": attributes.get("country"),
+            "state_province": attributes.get("state_province"),
+            "customer_state": attributes.get("customer_state"),  # Note: this might not be in API response
+            "postal_code": attributes.get("postal_code"),
+            "gender": attributes.get("gender"),
+            "date_joined": attributes.get("date_joined"),
+            "is_opted_in_to_sms": attributes.get("is_opted_in_to_sms"),
+            "completed_class_count": attributes.get("completed_class_count"),
+            "state_id": None,  
+            "created_at": None,          # Not needed if DB default
+            "created_by": None,
+            "updated_at": None,          # Not needed if DB default
+            "updated_by": None,
+            "deleted_at": None,
+            "deleted_by": None,
+        }
         logger.info(f"[VALIDATION] Location {location_id}, Account {account_id}: Validating customer id={raw.get('customer_id')}")
         try:
             customer = Customer(**raw)
@@ -31,7 +65,7 @@ async def fetch_customers_page(location_id: str, page: int, account_id: str, api
         except Exception as e:
             logger.warning(f"[VALIDATION] Location {location_id}, Account {account_id}: Skipping customer id={raw.get('customer_id')}: {e}")
     logger.info(f"[PAGE PROCESSED] Location {location_id}, Account {account_id}: Page {page} processed, {len(valid_customers)} valid customers")
-    return valid_customers, resp  
+    return valid_customers, resp   
 
 async def write_failed_entries(failed_entries, location_id, account_id):
     """Write failed page entries to DLQ temp file."""
@@ -45,55 +79,26 @@ async def write_failed_entries(failed_entries, location_id, account_id):
     logger.warning(f"[DLQ WRITE] Location {location_id}: {len(failed_entries)} pages written to {dlq_file}")
     return dlq_file
 
-async def retry_failed_entries(dlq_file, location_id, account_id, api_base_url, concurrency_limit=None):
-    """Retry failed pages from DLQ file in parallel and return recovered data + remaining failures."""
+async def retry_failed_entries(dlq_file, location_id, account_id, api_base_url):
+    """Retry failed pages from DLQ file and return recovered data + remaining failures."""
     if not os.path.exists(dlq_file):
         return [], 0
     
-    # Read all failed entries
-    failed_entries = []
-    with open(dlq_file, "r") as f:
-        for line in f:
-            entry = json.loads(line.strip())
-            failed_entries.append(entry)
-    
-    if not failed_entries:
-        return [], 0
-    
-    # Use concurrency limit (same as main processing)
-    if concurrency_limit is None:
-        concurrency_limit = settings.CONCURRENCY_LIMIT
-    semaphore = asyncio.Semaphore(concurrency_limit)
-    
-    async def retry_single_page(entry):
-        page = entry["page"]
-        async with semaphore:
-            try:
-                logger.info(f"[DLQ RETRY] Location {location_id}: Retrying page {page}")
-                customers, _ = await fetch_customers_page(location_id, page, account_id, api_base_url)
-                logger.info(f"[DLQ RETRY] Location {location_id}, page {page}: Success on retry - {len(customers)} customers recovered")
-                return {"success": True, "page": page, "customers": customers}
-            except Exception as e:
-                logger.error(f"[DLQ RETRY] Location {location_id}, page {page}: Failed again: {e}")
-                return {"success": False, "page": page, "error": str(e)}
-    
-    # Process all retries in parallel
-    tasks = [retry_single_page(entry) for entry in failed_entries]
-    results = await asyncio.gather(*tasks)
-    
-    # Collect results
     recovered_customers = []
     new_failed = []
     
-    for result in results:
-        if result["success"]:
-            recovered_customers.extend(result["customers"])
-        else:
-            new_failed.append({
-                "page": result["page"], 
-                "error": result["error"], 
-                "timestamp": time.time()
-            })
+    with open(dlq_file, "r") as f:
+        for line in f:
+            entry = json.loads(line.strip())
+            page = entry["page"]
+            try:
+                logger.info(f"[DLQ RETRY] Location {location_id}: Retrying page {page}")
+                customers, _ = await fetch_customers_page(location_id, page, account_id, api_base_url)
+                recovered_customers.extend(customers)
+                logger.info(f"[DLQ RETRY] Location {location_id}, page {page}: Success on retry - {len(customers)} customers recovered")
+            except Exception as e:
+                logger.error(f"[DLQ RETRY] Location {location_id}, page {page}: Failed again: {e}")
+                new_failed.append({"page": page, "error": str(e), "timestamp": time.time()})
     
     # Update or clean up DLQ file
     if new_failed:

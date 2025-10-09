@@ -2,6 +2,7 @@
 import io
 from typing import List, Dict
 import pandas as pd
+import math
 from sqlalchemy import create_engine, text
 from core.config import settings
 import boto3
@@ -9,6 +10,7 @@ from datetime import datetime
 import os
 import logging
 
+logger = logging.getLogger(__name__)
 
 s3_client = boto3.client("s3")
 
@@ -18,7 +20,7 @@ TABLE_COLUMNS_MAP = {
         'id', 'customer_id', 'location_id', 'account_id', 'first_name', 'last_name', 'email', 'full_name', 'birth_date', 'phone_number', 'address_line1', 'address_line2', 'address_line3', 'city', 'country', 'state_province', 'customer_state', 'postal_code', 'gender', 'date_joined', 'is_opted_in_to_sms', 'completed_class_count', 'state_id', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by'
     ],
     "orders": [
-        'id', 'order_id', 'date_placed', 'location', 'location_id' 'payment_sources_labels', 'status', 'order_lines_id', 'customer_id', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id'
+        'id', 'order_id', 'date_placed', 'location', 'location_id', 'payment_sources_labels', 'status', 'order_lines_id', 'customer_id', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id'
     ],
     "order_lines": [
         'id', 'order_line_id', 'order_id', 'transaction_type', 'location', 'credit_transactions_id', 'membership_transactions_id', 'title', 'processed_by', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'credit_transactions_ref_id', 'membership_transactions_ref_id', 'order_ref_id'
@@ -27,10 +29,10 @@ TABLE_COLUMNS_MAP = {
         'id', 'class_session_id', 'start_datetime', 'start_date', 'location', 'end_datetime', 'cancellation_datetime', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id'
     ],
     "credit_transactions": [
-        'id', 'credit_transactions_id', 'transaction_date', 'credit_name', 'is_expired', 'is_intro_offer', 'parent_credit_transaction_type', 'parent_credit_transaction_id', 'customer_id', 'location', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id'
+        'id', 'credit_transactions_id', 'transaction_date', 'credit_name', 'is_expired', 'remaining_credits_cache','is_intro_offer', 'parent_credit_transaction_type', 'parent_credit_transaction_id', 'customer_id', 'location', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id'
     ],
     "membership_transactions": [
-        'id', 'membership_transactions_id', 'transaction_date', 'membership_name', 'parent_membership_transaction_id', 'membership_instances_id', 'customer_id', 'location', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id', 'membership_instances_ref_id'
+        'id', 'membership_transactions_id', 'transaction_date', 'membership_name', 'parent_membership_transaction_id', 'membership_instances_id', 'customer_id', 'location','payment_interval_end_date', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id', 'membership_instances_ref_id'
     ],
     "membership_instances": [
         'id', 'membership_instances_id', 'purchase_date', 'membership_name', 'renewal_rate_incl_tax', 'status', 'location', 'renewal_count', 'next_charge_date', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id'
@@ -38,6 +40,15 @@ TABLE_COLUMNS_MAP = {
     "reservations": [
         'reservations_id', 'cancel_date', 'check_in_date', 'creation_date', 'status', 'credit_transactions_type', 'credit_transactions_id', 'credit_transactions_ref_id', 'membership_transactions_type', 'membership_transactions_id', 'membership_transactions_ref_id', 'guest', 'customer_id', 'customer_ref_id', 'class_session_id', 'class_session_ref_id', 'account_id', 'first_timer', 'reservation_type', 'location', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by'
     ]
+}
+
+# Define datetime columns explicitly - no guessing needed!
+DATETIME_COLUMNS = {
+    'birth_date', 'date_joined', 'created_at', 'updated_at', 'deleted_at',
+    'date_placed', 'start_datetime', 'start_date', 'end_datetime', 
+    'cancellation_datetime', 'transaction_date', 'payment_interval_end_date',
+    'purchase_date', 'next_charge_date', 'cancel_date', 'check_in_date', 
+    'creation_date'
 }
 
 TABLE_S3_CONFIG = {
@@ -94,24 +105,49 @@ def bulk_insert(table_name: str, rows: List[Dict], engine, columns=None):
         logger.warning(f"No rows to insert for {table_name}.")
         return
     
-    import math
-    import pandas as pd
-    def safe_str(val):
+    def safe_str(val, col_name=""):
         if val is None:
             return '\\N'
         if isinstance(val, float):
             if math.isnan(val):
                 return '\\N'
+            # Only convert Unix timestamps for known datetime columns
+            if col_name in DATETIME_COLUMNS and 1000000000 <= val <= 9999999999999:
+                try:
+                    dt = pd.to_datetime(val, unit='ms' if val > 1000000000000 else 's')
+                    return dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    pass
             # Convert float to int if it's a whole number
             if val == int(val):
                 return str(int(val))
             else:
                 return str(val)
+        if isinstance(val, int):
+            # Only convert Unix timestamps for known datetime columns
+            if col_name in DATETIME_COLUMNS and 1000000000 <= val <= 9999999999999:
+                try:
+                    dt = pd.to_datetime(val, unit='ms' if val > 1000000000000 else 's')
+                    return dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    pass
+            return str(val)
         if pd.isna(val):  # Handle pandas NaN
             return '\\N'
         if isinstance(val, str):
-            if val.strip().lower() in ['nan', 'none']:
+            if val.strip().lower() in ['nan', 'none', 'nat']:  # Added 'nat' for pandas NaT
                 return '\\N'
+            # Handle datetime columns with potential date formatting issues
+            if col_name in DATETIME_COLUMNS and val.strip():
+                val_clean = val.strip()
+                # Handle 2-digit year dates like "66-12-30"
+                if len(val_clean) == 8 and val_clean.count('-') == 2:
+                    parts = val_clean.split('-')
+                    if len(parts[0]) == 2 and parts[0].isdigit():
+                        year = int(parts[0])
+                        # Convert 2-digit year to 4-digit (assume 1900s for years 00-99)
+                        full_year = 1900 + year if year >= 0 else year
+                        val = f"{full_year}-{parts[1]}-{parts[2]}"
             # Escape commas, quotes, and newlines for CSV
             val = str(val).replace('"', '""')  # Escape quotes
             if ',' in val or '"' in val or '\n' in val or '\r' in val:
@@ -119,11 +155,11 @@ def bulk_insert(table_name: str, rows: List[Dict], engine, columns=None):
             return val
         return str(val)
     
-    # Create CSV data directly in memory
-    import io
+    # Create CSV data directly in memory with better performance
     output = io.StringIO()
     for row in rows:
-        output.write(','.join([safe_str(row.get(col, '')) for col in columns]) + '\n')
+        csv_row = [safe_str(row.get(col, ''), col) for col in columns]
+        output.write(','.join(csv_row) + '\n')
     output.seek(0)
     
     raw_conn = engine.raw_connection()
@@ -153,24 +189,6 @@ def read_parquet_s3(args):
 
     return df
 
-# # Fetch all Parquet files from S3 prefix and return a concatenated Polars DataFrame
-# def fetch_from_s3(bucket: str, prefix: str) -> pl.DataFrame:
-#     objects = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-#     parquet_keys = [obj["Key"] for obj in objects.get("Contents", []) if obj["Key"].endswith(".parquet")]
-#     if not parquet_keys:
-#         logger.warning(f"No Parquet files found in {prefix}")
-#         return pl.DataFrame([])
-#     dfs = []
-#     for key in parquet_keys:
-#         s3_path = f"s3://{bucket}/{key}"
-#         logger.info(f"Reading: {s3_path}")
-#         df = pl.read_parquet(s3_path, use_pyarrow=True)
-#         dfs.append(df)
-#     if dfs:
-#         return pl.concat(dfs, how="vertical")
-#     else:
-#         return pl.DataFrame([])
-
 def fetch_from_s3_pandas(bucket: str, prefix: str) -> pd.DataFrame:
     import concurrent.futures
     objects = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
@@ -184,53 +202,51 @@ def fetch_from_s3_pandas(bucket: str, prefix: str) -> pd.DataFrame:
     import warnings
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
         for df in executor.map(read_parquet_s3, [(bucket, key) for key in parquet_keys]):
-            # Convert all datetime columns to object type first to avoid bounds errors
+            # Simple datetime processing - just convert datetime columns to string to preserve Unix timestamps
             for col in df.columns:
-                if pd.api.types.is_datetime64_any_dtype(df[col]) or 'date' in col.lower():
-                    # Convert to string first, then back to datetime with error handling
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    # Convert datetime to string to prevent pandas auto-conversion issues
                     df[col] = df[col].astype(str)
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", UserWarning)
-                        df[col] = pd.to_datetime(df[col], errors='coerce')
             dfs.append(df)
     # Filter out empty DataFrames before concatenation
     dfs = [df for df in dfs if not df.empty]
     if dfs:
-        # Ensure all datetime columns have the same dtype across DataFrames
-        if len(dfs) > 1:
-            datetime_cols = set()
-            for df in dfs:
-                for col in df.columns:
-                    if pd.api.types.is_datetime64_any_dtype(df[col]) or 'date' in col.lower():
-                        datetime_cols.add(col)
-            
-            # Standardize datetime columns across all DataFrames
-            for col in datetime_cols:
-                for df in dfs:
-                    if col in df.columns:
-                        df[col] = pd.to_datetime(df[col], errors='coerce')
-        
         return pd.concat(dfs, axis=0, ignore_index=True)
     else:
         return pd.DataFrame()
 
 def clean_row(row, expected_columns):
-    import pandas as pd
-    import math
     clean = {}
     for col in expected_columns:
         val = row.get(col, None)
         # Handle various forms of null/NaN values
         if val == "":
             val = None
-        elif isinstance(val, str) and val.strip().lower() in ['nan', 'none', 'null']:
+        elif isinstance(val, str) and val.strip().lower() in ['nan', 'none', 'null', 'nat']:  # Added 'nat'
             val = None
+        elif isinstance(val, str) and col in DATETIME_COLUMNS and val.strip():
+            # Handle 2-digit year dates like "66-12-30"
+            val_clean = val.strip()
+            if len(val_clean) == 8 and val_clean.count('-') == 2:
+                parts = val_clean.split('-')
+                if len(parts[0]) == 2 and parts[0].isdigit():
+                    year = int(parts[0])
+                    # Convert 2-digit year to 4-digit (assume 1900s for years 00-99)
+                    full_year = 1900 + year if year >= 0 else year
+                    val = f"{full_year}-{parts[1]}-{parts[2]}"
         elif isinstance(val, float) and math.isnan(val):
             val = None
         elif pd.isna(val):
             val = None
         elif hasattr(val, 'isoformat'):
             val = val.strftime('%Y-%m-%d %H:%M:%S')
+        # Handle Unix timestamps only for known datetime columns
+        elif col in DATETIME_COLUMNS and isinstance(val, (int, float)) and 1000000000 <= val <= 9999999999999:
+            try:
+                dt = pd.to_datetime(val, unit='ms' if val > 1000000000000 else 's')
+                val = dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                pass
         clean[col] = val
     # Fill missing columns with None
     for col in expected_columns:
@@ -238,33 +254,6 @@ def clean_row(row, expected_columns):
             clean[col] = None
     return clean
 
-# Optionally pass a pydantic model for validation, else just clean
-
-# def filter_and_validate(df: pl.DataFrame, expected_columns: List[str], model=None, fk_accounts=None, fk_states=None, account_id=None) -> List[dict]:
-#     cleaned = []
-#     # Optionally set account_id for all rows
-#     if account_id is not None:
-#         df = df.with_columns(pl.lit(account_id).alias("account_id"))
-#     for row in df.to_dicts():
-#         clean = clean_row(row, expected_columns)
-#         if model:
-#             try:
-#                 obj = model(**clean)
-#                 # Optionally check FKs
-#                 if fk_accounts and hasattr(obj, 'account_id') and obj.account_id not in fk_accounts:
-#                     continue
-#                 if fk_states and hasattr(obj, 'state_id') and obj.state_id is not None and obj.state_id not in fk_states:
-#                     continue
-#                 cleaned.append(obj.model_dump())
-#             except Exception as e:
-#                 logger.warning(f"Validation error for row: {e}")
-#         else:
-#             cleaned.append(clean)
-#     return cleaned
-
-# def validate_and_clean(df: pl.DataFrame, expected_columns: List[str]) -> List[dict]:
-#     cleaned = [clean_row(row, expected_columns) for row in df.to_dicts()]
-#     return cleaned
 
 def etl_all_tables(bucket: str, account_id: str, engine):
     # Run create_staging_tables.sql before ETL
@@ -309,9 +298,13 @@ def etl_all_tables(bucket: str, account_id: str, engine):
             if account_id:
                 s3_prefix = f"{s3_prefix}/account_id_{account_id}"
             df = fetch_from_s3_pandas(bucket, s3_prefix)
+            
             # Replace NaN values with None before converting to dict
             df = df.where(pd.notnull(df), None)
+            
+            # Convert to records and clean each row
             cleaned_rows = [clean_row(row, TABLE_COLUMNS_MAP[table_name]) for row in df.to_dict(orient="records")]
+            
             # Use staging table for insert, logical table for columns
             bulk_insert(config["staging_table"], cleaned_rows, engine, columns=TABLE_COLUMNS_MAP[table_name])
             logger.info(f"✅ ETL COMPLETED for {table_name}: Successfully inserted {len(cleaned_rows)} rows into {config['staging_table']}")
@@ -358,5 +351,4 @@ if __name__ == "__main__":
         logger.error("⚠️  ETL process completed with errors - Some tables failed!")
         print("ETL process completed with errors.")
         sys.exit(1)
-
 

@@ -88,7 +88,7 @@ async def process_order_lines(account_id: str, location_id: int, engine):
                     SELECT COUNT(*) as count
                     FROM mt_order_lines_details_dlk
                     WHERE account_id = :account_id
-                      AND location_id = :location_id
+                      AND location = :location_id
                 """), {"account_id": account_id, "location_id": str(location_id)})
                 total_staging_after_cleanup = total_staging_result.fetchone()[0]
             logger.info(f"[process_order_lines] Total staging records after cleanup: {total_staging_after_cleanup}")
