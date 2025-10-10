@@ -27,13 +27,20 @@ def lambda_handler(event, context=None):
     engine = create_engine(settings.DATABASE_URL)
     try:
         logger.info(f"Starting ETL stage 2 for account_id={account_id}, location_id={location_id}")
-        etl_all_tables(bucket, account_id , engine)
-        logger.info("ETL stage 2 completed: Loaded all tables as staged")
-        return {
-            'status': 'success',
-            'account_id': account_id,
-            'location_id': location_id
-        }
+        print(f"Starting ETL stage 2 for account_id={account_id}, location_id={location_id}")
+        success = etl_all_tables(bucket, account_id , engine)
+        
+        if success:
+            logger.info("ETL stage 2 completed: Loaded all tables as staged")
+            return {
+                'status': 'success',
+                'account_id': account_id,
+                'location_id': location_id
+            }
+        else:
+            error_msg = "ETL stage 2 failed: Some tables failed to process"
+            logger.error(error_msg)
+            raise Exception(error_msg)
     except Exception as e:
         logger.error(f"Lambda execution failed: {e}")
         return {

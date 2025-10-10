@@ -1256,6 +1256,7 @@ class OrderLines(BaseModel):
     membership_transactions_ref_id: Optional[int] = None
     title: Optional[str] = None
     processed_by: bool = False
+    child_orders: List[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None  
     created_by: Optional[int] = None
     updated_at: Optional[datetime] = None

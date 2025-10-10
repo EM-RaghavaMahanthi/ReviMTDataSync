@@ -53,6 +53,13 @@ async def fetch_order_lines_page(location_id: str, page: int, account_id: str, a
 
         transaction_type, credit_transactions_id, membership_transactions_id = parse_single_transaction(attributes.get("transaction_data"))
 
+        # Extract child_orders list - collect all order IDs where type is "orders"
+        child_orders_data = relationships.get("child_orders", {}).get("data", [])
+        child_orders = []
+        for child in child_orders_data:
+            if child.get("type") == "orders" and child.get("id"):
+                child_orders.append(child["id"])
+
         raw = {
             "order_line_id": order_line_id,
             "order_id": order_ref_id,
@@ -71,7 +78,8 @@ async def fetch_order_lines_page(location_id: str, page: int, account_id: str, a
             "account_id": account_id,
             "order_ref_id": None,
             "credit_transactions_ref_id": None,
-            "membership_transactions_ref_id": None
+            "membership_transactions_ref_id": None,
+            "child_orders": child_orders
         }
 
         try:

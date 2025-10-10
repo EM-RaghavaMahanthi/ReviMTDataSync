@@ -97,6 +97,9 @@ TABLE_S3_CONFIG = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bulk_insert_etl")
 
+# Global variable to store all order IDs processed in the current ETL run
+PROCESSED_ORDER_IDS = set()
+
 def bulk_insert(table_name: str, rows: List[Dict], engine, columns=None):
     print(f"Running bulk insert for {table_name}...")
     if columns is None:
@@ -219,8 +222,17 @@ def clean_row(row, expected_columns):
     clean = {}
     for col in expected_columns:
         val = row.get(col, None)
+        # Handle numpy arrays and lists (especially for child_orders field)
+        if hasattr(val, '__iter__') and not isinstance(val, str):
+            # Convert arrays/lists to JSON string format
+            if hasattr(val, 'tolist'):  # numpy array
+                val = str(val.tolist()) if val.size > 0 else None
+            elif isinstance(val, (list, tuple)):
+                val = str(list(val)) if val else None
+            else:
+                val = str(val) if val is not None else None
         # Handle various forms of null/NaN values
-        if val == "":
+        elif val == "":
             val = None
         elif isinstance(val, str) and val.strip().lower() in ['nan', 'none', 'null', 'nat']:  # Added 'nat'
             val = None
@@ -255,7 +267,84 @@ def clean_row(row, expected_columns):
     return clean
 
 
+def validate_order_lines_with_child_orders(cleaned_rows: List[Dict]) -> List[Dict]:
+    """
+    Validate order_lines based on child_orders logic using processed order IDs:
+    - If child_orders is empty -> Valid (keep)
+    - If child_orders has values and ANY exist in processed orders -> Invalid (remove)
+    - If child_orders has values and NONE exist in processed orders -> Valid (keep)
+    """
+    global PROCESSED_ORDER_IDS
+    
+    if not cleaned_rows:
+        return []
+    
+    logger.info(f"Starting validation of {len(cleaned_rows)} order_lines entries using {len(PROCESSED_ORDER_IDS)} processed order IDs...")
+    
+    # Convert processed order IDs to strings for comparison (handles different data types)
+    existing_order_ids = {str(oid) for oid in PROCESSED_ORDER_IDS if oid}
+    
+    # Filter rows based on validation logic
+    valid_rows = []
+    invalid_count = 0
+    
+    for row in cleaned_rows:
+        child_orders = row.get('child_orders')
+        is_valid = True
+        
+        if child_orders:
+            # Parse child_orders for this specific row
+            row_child_order_ids = set()
+            if isinstance(child_orders, str):
+                # Try to parse as JSON list first, then fall back to comma-separated
+                try:
+                    import json
+                    child_order_list = json.loads(child_orders)
+                    if isinstance(child_order_list, list):
+                        row_child_order_ids.update(str(cid).strip() for cid in child_order_list if cid)
+                    else:
+                        # Single string value
+                        if child_orders.strip():
+                            row_child_order_ids.add(str(child_orders).strip())
+                except (json.JSONDecodeError, ValueError):
+                    # Handle comma-separated string
+                    if ',' in child_orders:
+                        row_child_order_ids.update(cid.strip() for cid in child_orders.split(',') if cid.strip())
+                    else:
+                        if child_orders.strip():
+                            row_child_order_ids.add(str(child_orders).strip())
+            elif isinstance(child_orders, list):
+                row_child_order_ids.update(str(cid).strip() for cid in child_orders if cid)
+            
+            # Check if ANY child order ID exists in processed orders -> Invalid
+            if row_child_order_ids:
+                matching_order_ids = [oid for oid in row_child_order_ids if oid in existing_order_ids]
+                if matching_order_ids:
+                    is_valid = False
+                    invalid_count += 1
+                    # Print detailed information about the invalid entry
+                    order_line_id = row.get('order_line_id', 'N/A')
+                    print(f"❌ INVALID order_line_id: {order_line_id}")
+                    print(f"   └── Child orders that exist in orders table: {matching_order_ids}")
+                    print(f"   └── All child orders for this line: {list(row_child_order_ids)}")
+                    logger.warning(f"Invalid order_line_id {order_line_id} with existing child orders: {matching_order_ids}")
+        
+        if is_valid:
+            valid_rows.append(row)
+    
+    print(f"Order lines validation completed: {len(valid_rows)} valid entries, {invalid_count} invalid entries removed")
+    if invalid_count > 0:
+        print(f"📊 TOTAL INVALID ORDER LINES: {invalid_count}")
+        logger.warning(f"Total invalid order lines filtered out: {invalid_count}")
+    return valid_rows
+
+
 def etl_all_tables(bucket: str, account_id: str, engine):
+    # Initialize global order IDs set for this ETL run
+    global PROCESSED_ORDER_IDS
+    PROCESSED_ORDER_IDS.clear()
+    logger.info("🔄 Initialized global order IDs storage for ETL run")
+    
     # Run create_staging_tables.sql before ETL
     sql_path = os.path.join(os.path.dirname(__file__), '../sql_cmds/create_staging_tables.sql')
     try:
@@ -304,6 +393,20 @@ def etl_all_tables(bucket: str, account_id: str, engine):
             
             # Convert to records and clean each row
             cleaned_rows = [clean_row(row, TABLE_COLUMNS_MAP[table_name]) for row in df.to_dict(orient="records")]
+            
+            # Collect order IDs when processing orders table for later validation
+            if table_name == "orders":
+                order_ids_in_batch = {row.get('order_id') for row in cleaned_rows if row.get('order_id')}
+                PROCESSED_ORDER_IDS.update(order_ids_in_batch)
+                print.info(f"📝 Collected {len(order_ids_in_batch)} order IDs from orders table (Total: {len(PROCESSED_ORDER_IDS)})")
+            
+            # Special validation for order_lines table based on child_orders
+            if table_name == "order_lines":
+                original_count = len(cleaned_rows)
+                cleaned_rows = validate_order_lines_with_child_orders(cleaned_rows)
+                filtered_count = original_count - len(cleaned_rows)
+                if filtered_count > 0:
+                    logger.info(f"🔍 order_lines validation: Filtered out {filtered_count} invalid entries with existing child orders")
             
             # Use staging table for insert, logical table for columns
             bulk_insert(config["staging_table"], cleaned_rows, engine, columns=TABLE_COLUMNS_MAP[table_name])
