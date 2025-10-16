@@ -278,7 +278,8 @@ async def async_lambda_handler(event, context):
                         response_payload = json.loads(response['Payload'].read())
                         # Check if the invocation succeeded
                         if response_payload.get("statusCode") == 200:
-                            child_body = json.loads(response_payload["body"])
+                            body = response_payload["body"]
+                            child_body = json.loads(body) if isinstance(body, str) else body
                             if 'results' in child_body:
                                 return child_body['results']
                             else:
@@ -379,7 +380,8 @@ async def async_lambda_handler(event, context):
                         response_payload = json.loads(response['Payload'].read())
                         # Check if the invocation succeeded
                         if response_payload.get("statusCode") == 200:
-                            child_body = json.loads(response_payload["body"])
+                            body = response_payload["body"]
+                            child_body = json.loads(body) if isinstance(body, str) else body
                             if 'results' in child_body:
                                 return child_body['results']
                             else:
@@ -483,7 +485,8 @@ async def async_lambda_handler(event, context):
                         )
                         response_payload = json.loads(response['Payload'].read())
                         if response_payload.get('statusCode') == 200:
-                            child_body = json.loads(response_payload['body'])
+                            body = response_payload['body']
+                            child_body = json.loads(body) if isinstance(body, str) else body
                             if 'results' in child_body:
                                 return child_body['results']
                             else:
@@ -645,10 +648,15 @@ async def async_lambda_handler(event, context):
         logger.info(f"[lambda_handler] Processed {entity_count} {entity_type}s for account_id={account_id} in {elapsed:.2f} seconds. Total records: {total_records}, Expected: {total_expected}")
         
         # Determine status based on data validation
+        failed_results = [r for r in results if r.get("status") == "failed"]
         missing_records_count = total_expected - total_records
-        if total_records == 0 or missing_records_count > 0:
+        
+        if failed_results:
             status = "error"
-            logger.error(f"[lambda_handler] Setting status=error for account_id={account_id}: total_records={total_records}, missing_records={missing_records_count}")
+            logger.error(f"[lambda_handler] Setting status=error for account_id={account_id}: {len(failed_results)} failed results found")
+        elif missing_records_count > 0:
+            status = "error" 
+            logger.error(f"[lambda_handler] Setting status=error for account_id={account_id}: missing_records={missing_records_count}")
         else:
             status = "success"
             logger.info(f"[lambda_handler] Setting status=success for account_id={account_id}: all records processed successfully")
@@ -666,7 +674,7 @@ async def async_lambda_handler(event, context):
         return {
             "status": status,
             "statusCode": 200,
-            "body": json.dumps(response_body)
+            "body": response_body
         }
     except Exception as exc:
         logger.critical(f"[lambda_handler] Lambda execution failed for account_id={account_id}: {exc}")
