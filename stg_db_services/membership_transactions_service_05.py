@@ -86,9 +86,32 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
         logger.error(f"[STEP 1] ERROR: Failed to count total records: {e}")
         raise
 
+async def step_1b_count_unnecessary_records(account_id: str, location_id: int, engine):
+    """
+    Step 1b: Count unnecessary records (isin_reservation = false) that won't be processed by reservations service
+    """
+    logger.info(f"[STEP 1b] Counting unnecessary records (isin_reservation = false)")
+    
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM mt_membership_transactions_details_dlk
+                WHERE account_id = :account_id
+                  AND location = :location_id
+                  AND isin_reservation = false
+            """), {"account_id": account_id, "location_id": location_id})
+            unnecessary_count = result.fetchone()[0]
+        
+        logger.info(f"[STEP 1b] SUCCESS: Unnecessary records (isin_reservation = false): {unnecessary_count}")
+        return unnecessary_count
+    except Exception as e:
+        logger.error(f"[STEP 1b] ERROR: Failed to count unnecessary records: {e}")
+        raise
+
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
-    Step 2: Count membership_transactions records already existing in main table
+    Step 2: Count membership_transactions records already existing in main table (only reservation related)
     """
     logger.info(f"[STEP 2] Counting membership_transactions records already in main table")
     
@@ -99,6 +122,7 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
                 FROM mt_membership_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND EXISTS (
                     SELECT 1 FROM membership_transactions mt
                     WHERE mt.membership_transactions_id = stg.membership_transactions_id
@@ -116,7 +140,7 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
 
 async def step_3_count_records_already_exist_in_main_table(account_id: str, location_id: int, engine):
     """
-    Step 3: Count membership_transactions records that already exist in main table (alternative count method)
+    Step 3: Count membership_transactions records that already exist in main table (alternative count method, only reservation related)
     """
     logger.info(f"[STEP 3] Verifying count of records already existing in main table")
     
@@ -131,6 +155,7 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
                   AND mt.location = stg.location
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
             """), {"account_id": account_id, "location_id": location_id})
             already_exist_count = result.fetchone()[0]
         
@@ -163,6 +188,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                                AND stg.account_id = mi.account_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND (c.id IS NULL OR mi.id IS NULL)
             """), {"account_id": account_id, "location_id": location_id})
             total_invalid_transactions = total_invalid_result.fetchone()[0]
@@ -176,6 +202,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                     AND c.location_id = :location_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND c.id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             missing_customer_transactions = missing_customers_result.fetchone()[0]
@@ -189,6 +216,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                                AND stg.account_id = mi.account_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND mi.id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             missing_instance_transactions = missing_instances_result.fetchone()[0]
@@ -199,6 +227,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                 FROM mt_membership_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND stg.customer_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             null_customer_transactions = null_customers_result.fetchone()[0]
@@ -209,6 +238,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                 FROM mt_membership_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND stg.membership_instances_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             null_instance_transactions = null_instances_result.fetchone()[0]
@@ -222,6 +252,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                     AND c.location_id = :location_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND stg.customer_id IS NOT NULL
                   AND c.id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
@@ -236,6 +267,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                                AND stg.account_id = mi.account_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_reservation = true
                   AND stg.membership_instances_id IS NOT NULL
                   AND mi.id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
@@ -277,6 +309,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                                    AND stg.account_id = mi.account_id
                     WHERE stg.account_id = :account_id
                       AND stg.location = :location_id
+                      AND stg.isin_reservation = true
                       AND (c.id IS NULL OR mi.id IS NULL)
                     ORDER BY stg.membership_transactions_id
                     LIMIT 10
@@ -332,6 +365,7 @@ async def step_6_count_records_to_insert(account_id: str, location_id: int, engi
                         and mi.location = :location_id
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
+                  AND mt.isin_reservation = true
                   AND mt.membership_transactions_id NOT IN (
                     SELECT membership_transactions_id FROM public.membership_transactions WHERE account_id = :account_id AND location = :location_id
                   )
@@ -376,6 +410,7 @@ async def step_7_insert_valid_records(account_id: str, location_id: int, engine)
                         and mi.location = :location_id
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
+                  AND mt.isin_reservation = true
                   AND mt.membership_transactions_id NOT IN (
                     SELECT membership_transactions_id FROM public.membership_transactions WHERE account_id = :account_id AND location = :location_id
                   )
@@ -413,6 +448,13 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
             logger.error(f"[process_membership_transactions] ERROR: Step 1 failed: {e}")
             raise
         
+        # Step 1b: Count unnecessary records (isin_reservation = false)
+        try:
+            unnecessary_records = await step_1b_count_unnecessary_records(account_id, location_id, engine)
+        except Exception as e:
+            logger.error(f"[process_membership_transactions] ERROR: Step 1b failed: {e}")
+            raise
+        
         # Step 2: Count records already existing in main table  
         try:
             already_exist_in_main = await step_2_count_existing_in_main_table(account_id, location_id, engine)
@@ -434,9 +476,9 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
             logger.error(f"[process_membership_transactions] ERROR: Step 4 failed: {e}")
             raise
         
-        # Step 5: Calculate expected records for insertion
+        # Step 5: Calculate expected records for insertion (with unnecessary records filtered out)
         try:
-            expected_ready = await step_5_calculate_expected_ready(account_id, location_id, total_staging_after_cleanup, already_exist_in_main, invalid_dependency_records)
+            expected_ready = await step_5_calculate_expected_ready(account_id, location_id, total_staging_after_cleanup - unnecessary_records, already_exist_in_main, invalid_dependency_records)
         except Exception as e:
             logger.error(f"[process_membership_transactions] ERROR: Step 5 failed: {e}")
             raise
@@ -457,11 +499,11 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
             logger.info(f"[process_membership_transactions] SUCCESS: Validation passed - {insert_ready_count} records ready for insertion as expected")
             
             # Step 7: Insert valid records (commented out for now)
-            try:
-                inserted_records = await step_7_insert_valid_records(account_id, location_id, engine)
-            except Exception as e:
-                logger.error(f"[process_membership_transactions] ERROR: Step 7 failed: {e}")
-                raise
+            # try:
+            #     inserted_records = await step_7_insert_valid_records(account_id, location_id, engine)
+            # except Exception as e:
+            #     logger.error(f"[process_membership_transactions] ERROR: Step 7 failed: {e}")
+            #     raise
         else:
             logger.warning(f"[process_membership_transactions] WARNING: No records to insert (expected_ready: {expected_ready})")
             insert_ready_count = 0
@@ -476,7 +518,8 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
         logger.info(f"[process_membership_transactions] PROCESS COMPLETE:")
         logger.info(f"  - Duplicates found in staging: {duplicates_found}")
         logger.info(f"  - Duplicates removed: {duplicates_removed}")
-        logger.info(f"  - Total staging records after cleanup: {total_staging_after_cleanup}")
+        logger.info(f"  - Total staging records after cleanup: {total_staging_after_cleanup}")        
+        logger.info(f"  - Unnecessary records (isin_reservation = false): {unnecessary_records} ({round((unnecessary_records / total_staging_after_cleanup * 100), 2) if total_staging_after_cleanup > 0 else 0.0}%)")
         logger.info(f"  - Records already exist in main table: {already_exist_in_main}")
         logger.info(f"  - Records with missing dependencies: {invalid_dependency_records}")
         logger.info(f"  - Records not inserted (missing deps + validation failures): {total_not_inserted} ({missing_percentage}%)")
@@ -486,6 +529,7 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
             "duplicates_found": duplicates_found,
             "duplicates_removed": duplicates_removed,
             "total_staging_after_cleanup": total_staging_after_cleanup,
+            "unnecessary_records": unnecessary_records,
             "already_exist_in_main_table": already_exist_in_main,
             "invalid_dependency_records": invalid_dependency_records,
             "missing_dependency_percentage": missing_percentage,

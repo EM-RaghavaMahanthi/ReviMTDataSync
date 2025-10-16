@@ -9,10 +9,12 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     PROD_DATABASE_URL: str
     API_KEY: str
-    PARQUET_BATCH_SIZE: int = 1000
+    PARQUET_BATCH_SIZE: int = 100000
     S3_BUCKET: str
     CONCURRENCY_LIMIT: int = 20
     PAGE_SIZE: int = 500
+
+    S3_CRM_PREFIX: str = "mariana-tek/raw-data"
 
     AWS_PROFILE_NAME: str = "raghava.revi"  
     CUSTOMERS_S3_PREFIX: str = "customers/"
@@ -39,5 +41,6 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "allow"  # Allow extra fields from .env
 
 settings = Settings()

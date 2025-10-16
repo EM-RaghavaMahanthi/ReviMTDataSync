@@ -86,6 +86,30 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
         logger.error(f"[STEP 1] ERROR: Failed to count total membership_transactions records: {e}")
         raise
 
+async def step_1b_count_unnecessary_records(account_id: str, location_id: int, engine):
+    """
+    Step 1b: Count membership_transactions records that are NOT used in order lines (isin_order_line = false)
+    These records will be kept in staging but not processed, saving processing time
+    """
+    logger.info(f"[STEP 1b] Counting membership_transactions records not used in order lines")
+    
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM mt_membership_transactions_details_dlk
+                WHERE account_id = :account_id
+                  AND location = :location_id
+                  AND isin_order_line = false
+            """), {"account_id": account_id, "location_id": location_id})
+            unnecessary_count = result.fetchone()[0]
+        
+        logger.info(f"[STEP 1b] SUCCESS: Unnecessary membership_transactions records (not in order lines): {unnecessary_count}")
+        return unnecessary_count
+    except Exception as e:
+        logger.error(f"[STEP 1b] ERROR: Failed to count unnecessary membership_transactions records: {e}")
+        raise
+
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
     Step 2: Count membership_transactions records already existing in main table
@@ -99,6 +123,7 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
                 FROM mt_membership_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_order_line = true
                   AND stg.membership_transactions_id IN (
                     SELECT membership_transactions_id FROM membership_transactions_orders 
                     WHERE account_id = :account_id AND location = :location_id
@@ -129,6 +154,7 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
                   AND mto.location = stg.location
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_order_line = true
             """), {"account_id": account_id, "location_id": location_id})
             already_exist_count = result.fetchone()[0]
         
@@ -160,6 +186,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                                   AND mi.location = :location_id
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
+                  AND mt.isin_order_line = true
                   AND (c.customer_id IS NULL OR mi.membership_instances_id IS NULL)
             """), {"account_id": account_id, "location_id": location_id})
             missing_dependencies_count = result.fetchone()[0]
@@ -172,6 +199,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                       AND c.account_id = :account_id
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
+                  AND mt.isin_order_line = true
                   AND c.customer_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             missing_customers_count = customer_result.fetchone()[0]
@@ -187,6 +215,7 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                                                   AND mi.location = :location_id
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
+                  AND mt.isin_order_line = true
                   AND mi.membership_instances_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             missing_membership_instances_count = mi_result.fetchone()[0]
@@ -205,17 +234,17 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
         logger.error(f"[STEP 4] ERROR: Failed to count membership_transactions with missing dependencies: {e}")
         raise
 
-async def step_5_calculate_expected_ready(account_id: str, location_id: int, total_staging_after_cleanup: int, already_exist_in_main: int, invalid_dependency_records: int):
+async def step_5_calculate_expected_ready(account_id: str, location_id: int, total_staging_after_cleanup: int, unnecessary_records: int, already_exist_in_main: int, invalid_dependency_records: int):
     """
     Step 5: Calculate expected records ready for insertion
-    Formula: total_staging_after_cleanup - already_exist_in_main - invalid_dependency_records
+    Formula: total_staging_after_cleanup - unnecessary_records - already_exist_in_main - invalid_dependency_records
     """
     logger.info(f"[STEP 5] Calculating expected records ready for insertion")
     
-    expected_ready = total_staging_after_cleanup - already_exist_in_main - invalid_dependency_records
+    expected_ready = total_staging_after_cleanup - unnecessary_records - already_exist_in_main - invalid_dependency_records
     
     logger.info(f"[STEP 5] SUCCESS: Expected ready for insertion: {expected_ready}")
-    logger.info(f"[STEP 5] Breakdown: Total_after_cleanup({total_staging_after_cleanup}) - Already_exist({already_exist_in_main}) - Invalid_Dependencies({invalid_dependency_records}) = {expected_ready}")
+    logger.info(f"[STEP 5] Breakdown: Total_after_cleanup({total_staging_after_cleanup}) - Unnecessary({unnecessary_records}) - Already_exist({already_exist_in_main}) - Invalid_Dependencies({invalid_dependency_records}) = {expected_ready}")
     
     return expected_ready
 
@@ -240,6 +269,7 @@ async def step_6_count_records_to_insert(account_id: str, location_id: int, engi
                 AND mt.account_id = mi.account_id
                 WHERE mt.account_id = :account_id 
                 AND mt.location = :location_id
+                AND mt.isin_order_line = true
                 AND mt.membership_transactions_id NOT IN (SELECT membership_transactions_id FROM public.membership_transactions_orders WHERE account_id = :account_id AND location = :location_id)
             """), {"account_id": account_id, "location_id": location_id})
             insert_ready_count = result.fetchone()[0]
@@ -278,6 +308,7 @@ async def step_7_insert_new_records(account_id: str, location_id: int, engine):
                 AND mt.account_id = mi.account_id
                 WHERE mt.account_id = :account_id
                 AND mt.location = :location_id
+                AND mt.isin_order_line = true
                 AND mt.membership_transactions_id NOT IN (SELECT membership_transactions_id FROM public.membership_transactions_orders WHERE account_id = :account_id AND location = :location_id)
             """), {"account_id": account_id, "location_id": location_id})
             inserted_count = result.rowcount
@@ -313,6 +344,13 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
             logger.error(f"[process_membership_transactions_orders] ERROR: Step 1 failed: {e}")
             raise
         
+        # Step 1b: Count unnecessary records (not used in order lines)
+        try:
+            unnecessary_records = await step_1b_count_unnecessary_records(account_id, location_id, engine)
+        except Exception as e:
+            logger.error(f"[process_membership_transactions_orders] ERROR: Step 1b failed: {e}")
+            raise
+        
         # Step 2: Count records already existing in main table  
         try:
             already_exist_in_main = await step_2_count_existing_in_main_table(account_id, location_id, engine)
@@ -336,7 +374,7 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
         
         # Step 5: Calculate expected records for insertion
         try:
-            expected_ready = await step_5_calculate_expected_ready(account_id, location_id, total_staging_after_cleanup, already_exist_in_main, invalid_dependency_records)
+            expected_ready = await step_5_calculate_expected_ready(account_id, location_id, total_staging_after_cleanup, unnecessary_records, already_exist_in_main, invalid_dependency_records)
         except Exception as e:
             logger.error(f"[process_membership_transactions_orders] ERROR: Step 5 failed: {e}")
             raise
@@ -357,11 +395,11 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
             logger.info(f"[process_membership_transactions_orders] SUCCESS: Validation passed - {insert_ready_count} records ready for insertion as expected")
             
             # Step 7: Insert new records
-            try:
-                inserted_records = await step_7_insert_new_records(account_id, location_id, engine)
-            except Exception as e:
-                logger.error(f"[process_membership_transactions_orders] ERROR: Step 7 failed: {e}")
-                raise
+            # try:
+            #     inserted_records = await step_7_insert_new_records(account_id, location_id, engine)
+            # except Exception as e:
+            #     logger.error(f"[process_membership_transactions_orders] ERROR: Step 7 failed: {e}")
+            #     raise
             
             # Final validation that insertion count matches expected
             if inserted_records == expected_ready:
@@ -374,8 +412,8 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
             insert_ready_count = 0
             inserted_records = 0
         
-        # Calculate missing percentage: (total - already_existing - inserted) / total * 100
-        total_not_inserted = total_staging_after_cleanup - already_exist_in_main - inserted_records
+        # Calculate missing percentage: (total - unnecessary - already_existing - inserted) / total * 100
+        total_not_inserted = total_staging_after_cleanup - unnecessary_records - already_exist_in_main - inserted_records
         missing_percentage = round((total_not_inserted / total_staging_after_cleanup * 100), 2) if total_staging_after_cleanup > 0 else 0.0
         
         # Summary
@@ -383,9 +421,10 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
         logger.info(f"  - Duplicates found in staging: {duplicates_found}")
         logger.info(f"  - Duplicates removed: {duplicates_removed}")
         logger.info(f"  - Total staging records after cleanup: {total_staging_after_cleanup}")
+        logger.info(f"  - Unnecessary records (not in order lines): {unnecessary_records}")
         logger.info(f"  - Records already exist in main table: {already_exist_in_main}")
         logger.info(f"  - Records with missing dependencies: {invalid_dependency_records}")
-        logger.info(f"  - Records not inserted (missing deps + validation failures): {total_not_inserted} ({missing_percentage}%)")
+        logger.info(f"  - Records not inserted (unnecessary + missing deps + validation failures): {total_not_inserted} ({missing_percentage}%)")
         logger.info(f"  - Records ready for insertion: {insert_ready_count}")
         logger.info(f"  - Actually inserted: {inserted_records}")
         
@@ -393,6 +432,7 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
             "duplicates_found": duplicates_found,
             "duplicates_removed": duplicates_removed,
             "total_staging_after_cleanup": total_staging_after_cleanup,
+            "unnecessary_records": unnecessary_records,
             "already_exist_in_main_table": already_exist_in_main,
             "invalid_dependency_records": invalid_dependency_records,
             "missing_dependency_percentage": missing_percentage,

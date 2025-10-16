@@ -86,6 +86,29 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
         logger.error(f"[STEP 1] ERROR: Failed to count total credit_transactions records: {e}")
         raise
 
+async def step_1b_count_unnecessary_records(account_id: str, location_id: int, engine):
+    """
+    Step 1b: Count unnecessary records (isin_order_line = false) that won't be processed by orders service
+    """
+    logger.info(f"[STEP 1b] Counting unnecessary records (isin_order_line = false)")
+    
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM mt_credit_transactions_details_dlk
+                WHERE account_id = :account_id
+                  AND location = :location_id
+                  AND isin_order_line = false
+            """), {"account_id": account_id, "location_id": location_id})
+            unnecessary_count = result.fetchone()[0]
+        
+        logger.info(f"[STEP 1b] SUCCESS: Unnecessary records (isin_order_line = false): {unnecessary_count}")
+        return unnecessary_count
+    except Exception as e:
+        logger.error(f"[STEP 1b] ERROR: Failed to count unnecessary records: {e}")
+        raise
+
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
     Step 2: Count entries already in main credit_transactions_orders table
@@ -110,7 +133,7 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
 
 async def step_3_count_records_already_exist_in_main_table(account_id: str, location_id: int, engine):
     """
-    Step 3: Count staging records that already exist in main table
+    Step 3: Count staging records that already exist in main table (only order_line related)
     """
     logger.info(f"[STEP 3] Counting staging records that already exist in main table")
     
@@ -121,6 +144,7 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
                 FROM mt_credit_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_order_line = true
                   AND stg.credit_transactions_id IN (
                     SELECT credit_transactions_id FROM credit_transactions_orders 
                     WHERE account_id = :account_id AND location = :location_id
@@ -149,6 +173,7 @@ async def step_4_count_credit_transactions_with_missing_customers(account_id: st
                 FROM mt_credit_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_order_line = true
                   AND (
                     stg.customer_id IS NULL
                     OR NOT EXISTS (
@@ -166,6 +191,7 @@ async def step_4_count_credit_transactions_with_missing_customers(account_id: st
                 FROM mt_credit_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_order_line = true
                   AND (
                     stg.customer_id IS NULL
                     OR NOT EXISTS (
@@ -183,6 +209,7 @@ async def step_4_count_credit_transactions_with_missing_customers(account_id: st
                 FROM mt_credit_transactions_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
+                  AND stg.isin_order_line = true
                   AND stg.customer_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             null_customer_transactions = null_result.fetchone()[0]
@@ -200,6 +227,7 @@ async def step_4_count_credit_transactions_with_missing_customers(account_id: st
                     FROM mt_credit_transactions_details_dlk stg
                     WHERE stg.account_id = :account_id
                       AND stg.location = :location_id
+                      AND stg.isin_order_line = true
                       AND (
                         stg.customer_id IS NULL
                         OR NOT EXISTS (
@@ -254,6 +282,7 @@ async def step_5_count_records_to_insert(account_id: str, location_id: int, engi
                 AND mt.account_id = c.account_id
                 WHERE mt.account_id = :account_id 
                 AND mt.location = :location_id
+                AND mt.isin_order_line = true
                 AND mt.credit_transactions_id NOT IN (SELECT credit_transactions_id FROM public.credit_transactions_orders WHERE account_id = :account_id AND location = :location_id)
             """), {"account_id": account_id, "location_id": location_id})
             insert_ready_count = result.fetchone()[0]
@@ -290,6 +319,7 @@ async def step_6_insert_new_records(account_id: str, location_id: int, engine):
                 AND mt.account_id = c.account_id
                 WHERE mt.account_id = :account_id 
                 AND mt.location = :location_id
+                AND mt.isin_order_line = true
                 AND mt.credit_transactions_id NOT IN (SELECT credit_transactions_id FROM public.credit_transactions_orders WHERE account_id = :account_id AND location = :location_id)
             """), {"account_id": account_id, "location_id": location_id})
             inserted_count = result.rowcount
@@ -312,6 +342,7 @@ async def process_credit_transactions_orders(account_id: str, location_id: int, 
     # Initialize variables for error handling
     duplicates_removed = 0
     total_staging = 0
+    unnecessary_records = 0
     existing_in_main = 0
     already_exist_in_main = 0
     missing_customer_transactions = 0
@@ -332,6 +363,13 @@ async def process_credit_transactions_orders(account_id: str, location_id: int, 
             total_staging = await step_1_count_total_records(account_id, location_id, engine)
         except Exception as e:
             logger.error(f"[process_credit_transactions_orders] ERROR: Step 1 failed: {e}")
+            raise
+        
+        # Step 1b: Count unnecessary records (isin_order_line = false)
+        try:
+            unnecessary_records = await step_1b_count_unnecessary_records(account_id, location_id, engine)
+        except Exception as e:
+            logger.error(f"[process_credit_transactions_orders] ERROR: Step 1b failed: {e}")
             raise
         
         # Step 2: Count existing records in main table
@@ -362,11 +400,11 @@ async def process_credit_transactions_orders(account_id: str, location_id: int, 
             logger.error(f"[process_credit_transactions_orders] ERROR: Step 5 failed: {e}")
             raise
         
-        # Step 6: Simple validation before insertion (since Step 0 cleaned duplicates)
-        expected_ready = total_staging - missing_customer_transactions - already_exist_in_main
+        # Step 6: Simple validation before insertion (with unnecessary records filtered out)
+        expected_ready = total_staging - unnecessary_records - missing_customer_transactions - already_exist_in_main
         
         logger.info(f"[process_credit_transactions_orders] Pre-insertion validation:")
-        logger.info(f"   Expected ready to insert: {expected_ready} (total - missing_customers - already_exist_in_main)")
+        logger.info(f"   Expected ready to insert: {expected_ready} (total - unnecessary - missing_customers - already_exist_in_main)")
         logger.info(f"   Actual ready to insert: {ready_to_insert}")
         
         if ready_to_insert != expected_ready:
@@ -377,23 +415,24 @@ async def process_credit_transactions_orders(account_id: str, location_id: int, 
         logger.info(f"[process_credit_transactions_orders] Validation passed - proceeding with insertion")
         
         # Step 7: Insert new records (optimize for zero records)
-        if ready_to_insert == 0:
-            logger.info(f"[process_credit_transactions_orders] No records to insert - skipping insertion step")
-            actual_inserted = 0
-        else:
-            try:
-                actual_inserted = await step_6_insert_new_records(account_id, location_id, engine)
-            except Exception as e:
-                logger.error(f"[process_credit_transactions_orders] ERROR: Step 7 failed: {e}")
-                raise
+        # if ready_to_insert == 0:
+        #     logger.info(f"[process_credit_transactions_orders] No records to insert - skipping insertion step")
+        #     actual_inserted = 0
+        # else:
+        #     try:
+        #         actual_inserted = await step_6_insert_new_records(account_id, location_id, engine)
+        #     except Exception as e:
+        #         logger.error(f"[process_credit_transactions_orders] ERROR: Step 7 failed: {e}")
+        #         raise
            
         # Summary logging
         logger.info(f"[process_credit_transactions_orders] SUMMARY for account_id={account_id}, location_id={location_id}:")
         logger.info(f"   Duplicates removed from staging: {duplicates_removed}")
         logger.info(f"   Total staging records (after cleanup): {total_staging}")
+        logger.info(f"   Unnecessary records (isin_order_line = false): {unnecessary_records} ({round((unnecessary_records / total_staging * 100), 2) if total_staging > 0 else 0.0}%)")
         logger.info(f"   Existing records in main table: {existing_in_main}")
         logger.info(f"   Records already exist in main: {already_exist_in_main}")
-        logger.info(f"   Records with missing customers: {missing_customer_transactions} ({round((missing_customer_transactions / total_staging * 100), 2) if total_staging > 0 else 0.0}%)")
+        logger.info(f"   Records with missing customers: {missing_customer_transactions} ({round((missing_customer_transactions / (total_staging - unnecessary_records) * 100), 2) if (total_staging - unnecessary_records) > 0 else 0.0}%)")
         logger.info(f"   Records ready for insertion: {ready_to_insert}")
         logger.info(f"   Actually inserted: {actual_inserted}")
         
@@ -408,6 +447,7 @@ async def process_credit_transactions_orders(account_id: str, location_id: int, 
         return {
             "duplicates_removed": duplicates_removed,
             "total_records": total_staging,
+            "unnecessary_records": unnecessary_records,
             "existing_records": existing_in_main,
             "already_exist_records": already_exist_in_main,
             "missing_customer_records": missing_customer_transactions,
@@ -421,6 +461,7 @@ async def process_credit_transactions_orders(account_id: str, location_id: int, 
         logger.error(f"[process_credit_transactions_orders] ERROR: Error occurred during processing. Partial results:")
         logger.error(f"[process_credit_transactions_orders]   Duplicates removed from staging: {duplicates_removed}")
         logger.error(f"[process_credit_transactions_orders]   Total staging records (after cleanup): {total_staging}")
+        logger.error(f"[process_credit_transactions_orders]   Unnecessary records (isin_order_line = false): {unnecessary_records}")
         logger.error(f"[process_credit_transactions_orders]   Existing records in main table: {existing_in_main}")
         logger.error(f"[process_credit_transactions_orders]   Records already exist in main: {already_exist_in_main}")
         logger.error(f"[process_credit_transactions_orders]   Records with missing customers: {missing_customer_transactions}")

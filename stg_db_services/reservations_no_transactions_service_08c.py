@@ -38,14 +38,23 @@ async def step_1_count_total_no_transactions_reservations(account_id: str, locat
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
     Step 2: Count no-transactions reservation records already existing in main table
+    Uses same JOIN conditions as insert logic to ensure accurate counting
     """
     logger.info(f"[STEP 2] Counting no-transactions reservation records already in main table")
     
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
-                SELECT COUNT(*) as count
+                SELECT COUNT(DISTINCT stg.reservations_id) as count
                 FROM mt_reservations_details_dlk stg
+                INNER JOIN customers c
+                  ON stg.customer_id = c.customer_id
+                  AND c.account_id = :account_id
+                  AND c.location_id = :location_id
+                INNER JOIN class_sessions cs
+                  ON stg.class_session_id = cs.class_session_id
+                  AND cs.account_id = :account_id
+                  AND cs.location = :location_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.credit_transactions_id IS NULL

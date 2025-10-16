@@ -1,5 +1,6 @@
 import sys
 import logging
+import time
 from db_services.main_bulk_insert_service import etl_all_tables
 from core.config import settings
 from sqlalchemy import create_engine
@@ -26,26 +27,34 @@ def lambda_handler(event, context=None):
     bucket = settings.S3_BUCKET
     engine = create_engine(settings.DATABASE_URL)
     try:
+        start_time = time.time()
         logger.info(f"Starting ETL stage 2 for account_id={account_id}, location_id={location_id}")
         print(f"Starting ETL stage 2 for account_id={account_id}, location_id={location_id}")
         success = etl_all_tables(bucket, account_id , engine)
         
+        end_time = time.time()
+        elapsed_time = round(end_time - start_time, 2)
+        
         if success:
-            logger.info("ETL stage 2 completed: Loaded all tables as staged")
+            logger.info(f"ETL stage 2 completed: Loaded all tables as staged (Time elapsed: {elapsed_time}s)")
             return {
                 'status': 'success',
                 'account_id': account_id,
-                'location_id': location_id
+                'location_id': location_id,
+                'elapsed_time_seconds': elapsed_time
             }
         else:
-            error_msg = "ETL stage 2 failed: Some tables failed to process"
+            error_msg = f"ETL stage 2 failed: Some tables failed to process (Time elapsed: {elapsed_time}s)"
             logger.error(error_msg)
             raise Exception(error_msg)
     except Exception as e:
-        logger.error(f"Lambda execution failed: {e}")
+        end_time = time.time()
+        elapsed_time = round(end_time - start_time, 2)
+        logger.error(f"Lambda execution failed: {e} (Time elapsed: {elapsed_time}s)")
         return {
             'status': 'error',
-            'error': str(e)
+            'error': str(e),
+            'elapsed_time_seconds': elapsed_time
         }
 
 # For local testing

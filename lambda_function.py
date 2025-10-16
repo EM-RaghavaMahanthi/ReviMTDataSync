@@ -111,6 +111,13 @@ async def async_lambda_handler(event, context):
     start_time = time.time()
     account_id = None
     try:
+
+        # return {
+        #     "status": "error",
+        #     "statusCode": 500,
+        #     "body": json.dumps(f"Lambda failed with error test")
+        # }
+
         event_body = get_event_body(event)
         resource = event_body.get("resource", "customers")
         account_id = event_body.get("account_id")
@@ -636,22 +643,35 @@ async def async_lambda_handler(event, context):
             entity_type = "location"
             entity_count = len(active_locations)
         logger.info(f"[lambda_handler] Processed {entity_count} {entity_type}s for account_id={account_id} in {elapsed:.2f} seconds. Total records: {total_records}, Expected: {total_expected}")
+        
+        # Determine status based on data validation
+        missing_records_count = total_expected - total_records
+        if total_records == 0 or missing_records_count > 0:
+            status = "error"
+            logger.error(f"[lambda_handler] Setting status=error for account_id={account_id}: total_records={total_records}, missing_records={missing_records_count}")
+        else:
+            status = "success"
+            logger.info(f"[lambda_handler] Setting status=success for account_id={account_id}: all records processed successfully")
+        
         response_body = {
+            "status": status,
             "message": f"{summary_msg} in {elapsed:.2f} seconds.",
             f"total_{entity_type}s": entity_count,
             "total_records": total_records,
             "total_expected": total_expected,
-            "missing_records": total_expected - total_records,
+            "missing_records": missing_records_count,
             "results": results
         }
         logger.info(f"[lambda_handler] Finished processing for resource={resource}, account_id={account_id}")
         return {
+            "status": status,
             "statusCode": 200,
             "body": json.dumps(response_body)
         }
     except Exception as exc:
         logger.critical(f"[lambda_handler] Lambda execution failed for account_id={account_id}: {exc}")
         return {
+            "status": "error",
             "statusCode": 500,
             "body": json.dumps(f"Lambda failed with error: {exc}")
         }

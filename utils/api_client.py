@@ -17,6 +17,6 @@ async def api_get(path: str, api_base_url: str , params: dict = None):
         "Accept": "application/vnd.api+json"
     }
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params, timeout=30) as resp:
+        async with session.get(url, headers=headers, params=params, timeout=60) as resp:
             resp.raise_for_status()
             return await resp.json()

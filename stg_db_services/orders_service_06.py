@@ -84,24 +84,29 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
 
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
-    Step 2: Count orders records already existing in main table
+    Step 2: Count orders records already existing in main table with customer dependency validation
+    Now uses same logic as steps 6-7 to ensure accurate counting
     """
-    logger.info(f"[STEP 2] Counting orders records already in main table")
+    logger.info(f"[STEP 2] Counting orders records already in main table (with customer validation)")
     
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_orders_details_dlk stg
+                INNER JOIN customers c 
+                  ON stg.customer_id = c.customer_id  
+                  AND stg.account_id = c.account_id
+                  AND c.location_id = :location_id
                 WHERE stg.account_id = :account_id
                   AND stg.order_id IN (
                     SELECT order_id FROM orders 
                     WHERE account_id = :account_id
                   )
-            """), {"account_id": account_id})
+            """), {"account_id": account_id, "location_id": location_id})
             existing_count = result.fetchone()[0]
         
-        logger.info(f"[STEP 2] SUCCESS: Records already exist in main table: {existing_count}")
+        logger.info(f"[STEP 2] SUCCESS: Records already exist in main table (with valid customers): {existing_count}")
         return existing_count
     except Exception as e:
         logger.error(f"[STEP 2] ERROR: Failed to count existing orders: {e}")
@@ -109,23 +114,28 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
 
 async def step_3_count_records_already_exist_in_main_table(account_id: str, location_id: int, engine):
     """
-    Step 3: Count orders records that already exist in main table (alternative method)
+    Step 3: Count orders records that already exist in main table with customer dependency validation (verification method)
+    Now uses same logic as steps 2, 6-7 to ensure consistent counting
     """
-    logger.info(f"[STEP 3] Verifying count of records already existing in main table")
+    logger.info(f"[STEP 3] Verifying count of records already existing in main table (with customer validation)")
     
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_orders_details_dlk stg
+                INNER JOIN customers c 
+                  ON stg.customer_id = c.customer_id  
+                  AND stg.account_id = c.account_id
+                  AND c.location_id = :location_id
                 INNER JOIN orders o
                   ON o.order_id = stg.order_id
                   AND o.account_id = stg.account_id
                 WHERE stg.account_id = :account_id
-            """), {"account_id": account_id})
+            """), {"account_id": account_id, "location_id": location_id})
             already_exist_count = result.fetchone()[0]
         
-        logger.info(f"[STEP 3] SUCCESS: Records already exist in main table (verification): {already_exist_count}")
+        logger.info(f"[STEP 3] SUCCESS: Records already exist in main table (verification with valid customers): {already_exist_count}")
         return already_exist_count
     except Exception as e:
         logger.error(f"[STEP 3] ERROR: Failed to verify existing orders: {e}")

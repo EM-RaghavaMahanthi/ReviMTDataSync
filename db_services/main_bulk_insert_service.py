@@ -29,10 +29,10 @@ TABLE_COLUMNS_MAP = {
         'id', 'class_session_id', 'start_datetime', 'start_date', 'location', 'end_datetime', 'cancellation_datetime', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id'
     ],
     "credit_transactions": [
-        'id', 'credit_transactions_id', 'transaction_date', 'credit_name', 'is_expired', 'remaining_credits_cache','is_intro_offer', 'parent_credit_transaction_type', 'parent_credit_transaction_id', 'customer_id', 'location', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id'
+        'id', 'credit_transactions_id', 'transaction_date', 'credit_name', 'is_expired', 'remaining_credits_cache','is_intro_offer', 'parent_credit_transaction_type', 'parent_credit_transaction_id', 'customer_id', 'location', 'isin_order_line', 'isin_reservation', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id'
     ],
     "membership_transactions": [
-        'id', 'membership_transactions_id', 'transaction_date', 'membership_name', 'parent_membership_transaction_id', 'membership_instances_id', 'customer_id', 'location','payment_interval_end_date', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id', 'membership_instances_ref_id'
+        'id', 'membership_transactions_id', 'transaction_date', 'membership_name', 'parent_membership_transaction_id', 'membership_instances_id', 'customer_id', 'location','payment_interval_end_date', 'isin_order_line', 'isin_reservation', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id', 'customer_ref_id', 'membership_instances_ref_id'
     ],
     "membership_instances": [
         'id', 'membership_instances_id', 'purchase_date', 'membership_name', 'renewal_rate_incl_tax', 'status', 'location', 'renewal_count', 'next_charge_date', 'created_at', 'created_by', 'updated_at', 'updated_by', 'deleted_at', 'deleted_by', 'account_id'
@@ -72,6 +72,16 @@ TABLE_S3_CONFIG = {
         "target_table": "class_sessions",
         "staging_table": "mt_class_sessions_details_dlk"
     },
+    "reservations": {
+        "s3_prefix": settings.RESERVATIONS_S3_PREFIX,
+        "target_table": "reservations",
+        "staging_table": "mt_reservations_details_dlk"
+    },
+    "membership_instances": {
+        "s3_prefix": settings.MEMBERSHIP_INSTANCES_S3_PREFIX,
+        "target_table": "membership_instances",
+        "staging_table": "mt_membership_instances_details_dlk"
+    },
     "credit_transactions": {
         "s3_prefix": settings.CREDIT_TRANSACTIONS_S3_PREFIX,
         "target_table": "credit_transactions",
@@ -82,23 +92,17 @@ TABLE_S3_CONFIG = {
         "target_table": "membership_transactions",
         "staging_table": "mt_membership_transactions_details_dlk"
     },
-    "membership_instances": {
-        "s3_prefix": settings.MEMBERSHIP_INSTANCES_S3_PREFIX,
-        "target_table": "membership_instances",
-        "staging_table": "mt_membership_instances_details_dlk"
-    },
-    "reservations": {
-        "s3_prefix": settings.RESERVATIONS_S3_PREFIX,
-        "target_table": "reservations",
-        "staging_table": "mt_reservations_details_dlk"
-    },
 }
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bulk_insert_etl")
 
-# Global variable to store all order IDs processed in the current ETL run
+# Global variables to store IDs processed in the current ETL run
 PROCESSED_ORDER_IDS = set()
+ORDER_LINE_CREDIT_TRANSACTION_IDS = set()
+RESERVATION_CREDIT_TRANSACTION_IDS = set()
+ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS = set()
+RESERVATION_MEMBERSHIP_TRANSACTION_IDS = set()
 
 def bulk_insert(table_name: str, rows: List[Dict], engine, columns=None):
     print(f"Running bulk insert for {table_name}...")
@@ -339,11 +343,105 @@ def validate_order_lines_with_child_orders(cleaned_rows: List[Dict]) -> List[Dic
     return valid_rows
 
 
+def add_credit_transaction_flags(cleaned_rows: List[Dict]) -> List[Dict]:
+    """
+    Add isin_order_line and isin_reservation boolean flags to credit_transactions:
+    - isin_order_line: True if credit_transactions_id exists in order_lines table
+    - isin_reservation: True if credit_transactions_id exists in reservations table
+    """
+    global ORDER_LINE_CREDIT_TRANSACTION_IDS, RESERVATION_CREDIT_TRANSACTION_IDS
+    
+    if not cleaned_rows:
+        return []
+    
+    logger.info(f"Adding credit transaction flags to {len(cleaned_rows)} credit_transactions entries...")
+    logger.info(f"Using {len(ORDER_LINE_CREDIT_TRANSACTION_IDS)} order_line credit IDs and {len(RESERVATION_CREDIT_TRANSACTION_IDS)} reservation credit IDs")
+    
+    # Keep as integers for comparison
+    order_line_credit_ids = {cid for cid in ORDER_LINE_CREDIT_TRANSACTION_IDS if cid is not None}
+    reservation_credit_ids = {cid for cid in RESERVATION_CREDIT_TRANSACTION_IDS if cid is not None}
+    
+    updated_rows = []
+    order_line_matches = 0
+    reservation_matches = 0
+
+    print(f"Total credit transactions to process: {len(cleaned_rows)}")
+    
+    for row in cleaned_rows:
+        credit_tx_id = row.get('credit_transactions_id')
+        
+        # Set boolean flags (keep integer comparison)
+        row['isin_order_line'] = credit_tx_id in order_line_credit_ids if credit_tx_id is not None else False
+        row['isin_reservation'] = credit_tx_id in reservation_credit_ids if credit_tx_id is not None else False
+        
+        # Count matches for logging
+        if row['isin_order_line']:
+            order_line_matches += 1
+        if row['isin_reservation']:
+            reservation_matches += 1
+        
+        updated_rows.append(row)
+    
+    print(f"Credit transaction flags added: {order_line_matches} matched order_lines, {reservation_matches} matched reservations")
+    print(f"Percentage of credit transactions linked to order_lines: {round((order_line_matches / len(cleaned_rows) * 100), 2) if len(cleaned_rows) > 0 else 0.0}%")
+    print(f"Percentage of credit transactions linked to reservations: {round((reservation_matches / len(cleaned_rows) * 100), 2) if len(cleaned_rows) > 0 else 0.0}%")
+    return updated_rows
+
+
+def add_membership_transaction_flags(cleaned_rows: List[Dict]) -> List[Dict]:
+    """
+    Add isin_order_line and isin_reservation boolean flags to membership_transactions:
+    - isin_order_line: True if membership_transactions_id exists in order_lines table
+    - isin_reservation: True if membership_transactions_id exists in reservations table
+    """
+    global ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS, RESERVATION_MEMBERSHIP_TRANSACTION_IDS
+    
+    if not cleaned_rows:
+        return []
+    
+    logger.info(f"Adding membership transaction flags to {len(cleaned_rows)} membership_transactions entries...")
+    logger.info(f"Using {len(ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS)} order_line membership IDs and {len(RESERVATION_MEMBERSHIP_TRANSACTION_IDS)} reservation membership IDs")
+    
+    # Keep as integers for comparison
+    order_line_membership_ids = {mid for mid in ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS if mid is not None}
+    reservation_membership_ids = {mid for mid in RESERVATION_MEMBERSHIP_TRANSACTION_IDS if mid is not None}
+    
+    updated_rows = []
+    order_line_matches = 0
+    reservation_matches = 0
+
+    print(f"Total membership transactions to process: {len(cleaned_rows)}")
+    
+    for row in cleaned_rows:
+        membership_tx_id = row.get('membership_transactions_id')
+        
+        # Set boolean flags (keep integer comparison)
+        row['isin_order_line'] = membership_tx_id in order_line_membership_ids if membership_tx_id is not None else False
+        row['isin_reservation'] = membership_tx_id in reservation_membership_ids if membership_tx_id is not None else False
+        
+        # Count matches for logging
+        if row['isin_order_line']:
+            order_line_matches += 1
+        if row['isin_reservation']:
+            reservation_matches += 1
+        
+        updated_rows.append(row)
+
+    print(f"Membership transaction flags added: {order_line_matches} matched order_lines, {reservation_matches} matched reservations")
+    print(f"Percentage of Membership transactions linked to order_lines: {round((order_line_matches / len(cleaned_rows) * 100), 2) if len(cleaned_rows) > 0 else 0.0}%")
+    print(f"Percentage of Membership transactions linked to reservations: {round((reservation_matches / len(cleaned_rows) * 100), 2) if len(cleaned_rows) > 0 else 0.0}%")
+    return updated_rows
+
+
 def etl_all_tables(bucket: str, account_id: str, engine):
-    # Initialize global order IDs set for this ETL run
-    global PROCESSED_ORDER_IDS
+    # Initialize global ID sets for this ETL run
+    global PROCESSED_ORDER_IDS, ORDER_LINE_CREDIT_TRANSACTION_IDS, RESERVATION_CREDIT_TRANSACTION_IDS, ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS, RESERVATION_MEMBERSHIP_TRANSACTION_IDS
     PROCESSED_ORDER_IDS.clear()
-    logger.info("🔄 Initialized global order IDs storage for ETL run")
+    ORDER_LINE_CREDIT_TRANSACTION_IDS.clear()
+    RESERVATION_CREDIT_TRANSACTION_IDS.clear()
+    ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS.clear()
+    RESERVATION_MEMBERSHIP_TRANSACTION_IDS.clear()
+    logger.info("🔄 Initialized global ID storage for ETL run")
     
     # Run create_staging_tables.sql before ETL
     sql_path = os.path.join(os.path.dirname(__file__), '../sql_cmds/create_staging_tables.sql')
@@ -398,8 +496,26 @@ def etl_all_tables(bucket: str, account_id: str, engine):
             if table_name == "orders":
                 order_ids_in_batch = {row.get('order_id') for row in cleaned_rows if row.get('order_id')}
                 PROCESSED_ORDER_IDS.update(order_ids_in_batch)
-                print.info(f"📝 Collected {len(order_ids_in_batch)} order IDs from orders table (Total: {len(PROCESSED_ORDER_IDS)})")
+                logger.info(f"📝 Collected {len(order_ids_in_batch)} order IDs from orders table (Total: {len(PROCESSED_ORDER_IDS)})")
             
+            # Collect credit transaction IDs from order_lines table
+            if table_name == "order_lines":
+                credit_tx_ids_in_batch = {row.get('credit_transactions_id') for row in cleaned_rows if row.get('credit_transactions_id')}
+                membership_tx_ids_in_batch = {row.get('membership_transactions_id') for row in cleaned_rows if row.get('membership_transactions_id')}
+                ORDER_LINE_CREDIT_TRANSACTION_IDS.update(credit_tx_ids_in_batch)
+                ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS.update(membership_tx_ids_in_batch)
+                print(f"📝 Collected {len(credit_tx_ids_in_batch)} credit transaction IDs from order_lines table (Total: {len(ORDER_LINE_CREDIT_TRANSACTION_IDS)})")
+                print(f"📝 Collected {len(membership_tx_ids_in_batch)} membership transaction IDs from order_lines table (Total: {len(ORDER_LINE_MEMBERSHIP_TRANSACTION_IDS)})")
+            
+            # Collect credit and membership transaction IDs from reservations table
+            if table_name == "reservations":
+                credit_tx_ids_in_batch = {row.get('credit_transactions_id') for row in cleaned_rows if row.get('credit_transactions_id')}
+                membership_tx_ids_in_batch = {row.get('membership_transactions_id') for row in cleaned_rows if row.get('membership_transactions_id')}
+                RESERVATION_CREDIT_TRANSACTION_IDS.update(credit_tx_ids_in_batch)
+                RESERVATION_MEMBERSHIP_TRANSACTION_IDS.update(membership_tx_ids_in_batch)
+                print(f"📝 Collected {len(credit_tx_ids_in_batch)} credit transaction IDs from reservations table (Total: {len(RESERVATION_CREDIT_TRANSACTION_IDS)})")
+                print(f"📝 Collected {len(membership_tx_ids_in_batch)} membership transaction IDs from reservations table (Total: {len(RESERVATION_MEMBERSHIP_TRANSACTION_IDS)})")
+
             # Special validation for order_lines table based on child_orders
             if table_name == "order_lines":
                 original_count = len(cleaned_rows)
@@ -407,6 +523,14 @@ def etl_all_tables(bucket: str, account_id: str, engine):
                 filtered_count = original_count - len(cleaned_rows)
                 if filtered_count > 0:
                     logger.info(f"🔍 order_lines validation: Filtered out {filtered_count} invalid entries with existing child orders")
+            
+            # Add boolean flags for credit_transactions table
+            if table_name == "credit_transactions":
+                cleaned_rows = add_credit_transaction_flags(cleaned_rows)
+            
+            # Add boolean flags for membership_transactions table
+            if table_name == "membership_transactions":
+                cleaned_rows = add_membership_transaction_flags(cleaned_rows)
             
             # Use staging table for insert, logical table for columns
             bulk_insert(config["staging_table"], cleaned_rows, engine, columns=TABLE_COLUMNS_MAP[table_name])
@@ -431,8 +555,10 @@ def etl_all_tables(bucket: str, account_id: str, engine):
     # Summary logging
     logger.info(f"ETL SUMMARY: {len(successful_tables)}/{total_tables} tables completed successfully")
     if successful_tables:
+        print(f"✅ Successful tables: {', '.join(successful_tables)}")
         logger.info(f"✅ Successful tables: {', '.join(successful_tables)}")
     if failed_tables:
+        print(f"❌ Failed tables: {', '.join(failed_tables)}")
         logger.error(f"❌ Failed tables: {', '.join(failed_tables)}")
     
     return len(failed_tables) == 0  # Return True if all succeeded
