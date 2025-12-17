@@ -71,8 +71,8 @@ async def step_1_calculate_first_timer_field_with_pandas(account_id: str, locati
             ].copy()
             
             if len(eligible_reservations) > 0:
-                # Sort by customer and start_datetime to find first reservation
-                eligible_reservations = eligible_reservations.sort_values(['customer_id', 'start_datetime'])
+                # Sort by customer, start_datetime, and reservations_id (secondary sort)
+                eligible_reservations = eligible_reservations.sort_values(['customer_id', 'start_datetime', 'reservations_id'])
                 eligible_reservations['rn'] = eligible_reservations.groupby('customer_id').cumcount() + 1
                 
                 # Get first eligible reservation per customer (rn = 1)

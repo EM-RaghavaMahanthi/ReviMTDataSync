@@ -167,129 +167,22 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
 
 async def step_4_count_transactions_with_missing_dependencies(account_id: str, location_id: int, engine):
     """
-    Step 3: Count membership_transactions records with missing customer or membership_instances dependencies
-    Uses DISTINCT with LEFT JOINs to find records that would fail the INNER JOIN in insertion
-    This approach scales cleanly to any number of dependencies
+    Step 4: Count membership_transactions records with missing customer or membership_instances dependencies
+    OPTIMIZED: Single query with LEFT JOINs instead of 7 separate queries
     """
-    logger.info(f"[STEP 3] Counting membership_transactions records with missing dependencies")
+    logger.info(f"[STEP 4] Counting membership_transactions records with missing dependencies")
     
     try:
-        with engine.begin() as conn:
-            # Count records that would fail the INNER JOINs in the insertion query
-            # This mirrors the exact logic used in step_5_insert_valid_records
-            total_invalid_result = conn.execute(text("""
-                SELECT COUNT(DISTINCT stg.membership_transactions_id) as count
-                FROM mt_membership_transactions_details_dlk stg
-                LEFT JOIN customers c ON stg.customer_id = c.customer_id  
-                                    AND c.account_id = stg.account_id
-                                    AND c.location_id = :location_id
-                LEFT JOIN membership_instances mi ON stg.membership_instances_id = mi.membership_instances_id 
-                                               AND stg.location = mi.location 
-                                               AND stg.account_id = mi.account_id
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND (c.id IS NULL OR mi.id IS NULL)
-            """), {"account_id": account_id, "location_id": location_id})
-            total_invalid_transactions = total_invalid_result.fetchone()[0]
-            
-            # Count records with missing customer dependencies for detailed logging
-            missing_customers_result = conn.execute(text("""
-                SELECT COUNT(DISTINCT stg.membership_transactions_id) as count
-                FROM mt_membership_transactions_details_dlk stg
-                LEFT JOIN customers c ON stg.customer_id = c.customer_id  
-                                    AND c.account_id = stg.account_id
-                                    AND c.location_id = :location_id
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND c.id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            missing_customer_transactions = missing_customers_result.fetchone()[0]
-            
-            # Count records with missing membership_instances dependencies for detailed logging
-            missing_instances_result = conn.execute(text("""
-                SELECT COUNT(DISTINCT stg.membership_transactions_id) as count
-                FROM mt_membership_transactions_details_dlk stg
-                LEFT JOIN membership_instances mi ON stg.membership_instances_id = mi.membership_instances_id 
-                                               AND stg.location = mi.location 
-                                               AND stg.account_id = mi.account_id
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND mi.id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            missing_instance_transactions = missing_instances_result.fetchone()[0]
-            
-            # Count NULL customer_ids specifically
-            null_customers_result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_membership_transactions_details_dlk stg
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND stg.customer_id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            null_customer_transactions = null_customers_result.fetchone()[0]
-            
-            # Count NULL membership_instances_ids specifically
-            null_instances_result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_membership_transactions_details_dlk stg
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND stg.membership_instances_id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            null_instance_transactions = null_instances_result.fetchone()[0]
-            
-            # Count distinct missing customers (excluding NULLs)
-            distinct_missing_customers_result = conn.execute(text("""
-                SELECT COUNT(DISTINCT stg.customer_id) as count
-                FROM mt_membership_transactions_details_dlk stg
-                LEFT JOIN customers c ON stg.customer_id = c.customer_id  
-                                    AND c.account_id = stg.account_id
-                                    AND c.location_id = :location_id
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND stg.customer_id IS NOT NULL
-                  AND c.id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            distinct_missing_customers = distinct_missing_customers_result.fetchone()[0]
-            
-            # Count distinct missing membership_instances (excluding NULLs)
-            distinct_missing_instances_result = conn.execute(text("""
-                SELECT COUNT(DISTINCT stg.membership_instances_id) as count
-                FROM mt_membership_transactions_details_dlk stg
-                LEFT JOIN membership_instances mi ON stg.membership_instances_id = mi.membership_instances_id 
-                                               AND stg.location = mi.location 
-                                               AND stg.account_id = mi.account_id
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND stg.membership_instances_id IS NOT NULL
-                  AND mi.id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            distinct_missing_instances = distinct_missing_instances_result.fetchone()[0]
-        
-        # Log detailed dependency information
-        if total_invalid_transactions > 0:
-            logger.warning(f"[STEP 3] Found {total_invalid_transactions} membership_transactions records with missing dependencies")
-            logger.warning(f"[STEP 3] Customer dependency issues: {missing_customer_transactions} records")
-            logger.warning(f"[STEP 3] Membership_instances dependency issues: {missing_instance_transactions} records")
-            logger.warning(f"[STEP 3] NULL customer_id: {null_customer_transactions} records")
-            logger.warning(f"[STEP 3] NULL membership_instances_id: {null_instance_transactions} records")
-            logger.warning(f"[STEP 3] Distinct missing customers: {distinct_missing_customers}")
-            logger.warning(f"[STEP 3] Distinct missing membership_instances: {distinct_missing_instances}")
-            
-            # Get sample of problematic records for debugging
-            with engine.begin() as conn:
-                sample_result = conn.execute(text("""
+        with engine.begin() as conn:  # ✅ Single connection for all queries
+            # ✅ OPTIMIZED: Single query gets ALL metrics at once!
+            result = conn.execute(text("""
+                WITH dependency_analysis AS (
                     SELECT 
                         stg.membership_transactions_id,
                         stg.customer_id,
                         stg.membership_instances_id,
+                        c.id as customer_ref_id,
+                        mi.id as membership_instance_ref_id,
                         CASE 
                             WHEN stg.customer_id IS NULL THEN 'NULL_CUSTOMER'
                             WHEN c.id IS NULL THEN 'MISSING_CUSTOMER'
@@ -301,33 +194,104 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
                             ELSE 'VALID_INSTANCE'
                         END as instance_status
                     FROM mt_membership_transactions_details_dlk stg
-                    LEFT JOIN customers c ON stg.customer_id = c.customer_id  
-                                        AND c.account_id = stg.account_id
-                                        AND c.location_id = :location_id
-                    LEFT JOIN membership_instances mi ON stg.membership_instances_id = mi.membership_instances_id 
-                                                   AND stg.location = mi.location 
-                                                   AND stg.account_id = mi.account_id
+                    LEFT JOIN customers c ON c.customer_id = stg.customer_id  
+                        AND c.account_id = stg.account_id
+                        AND c.location_id = :location_id
+                    LEFT JOIN membership_instances mi ON mi.membership_instances_id = stg.membership_instances_id 
+                        AND mi.location = stg.location 
+                        AND mi.account_id = stg.account_id
                     WHERE stg.account_id = :account_id
                       AND stg.location = :location_id
                       AND stg.isin_reservation = true
-                      AND (c.id IS NULL OR mi.id IS NULL)
-                    ORDER BY stg.membership_transactions_id
-                    LIMIT 10
-                """), {"account_id": account_id, "location_id": location_id})
-                sample_details = [(row[0], row[1], row[2], row[3], row[4]) for row in sample_result.fetchall()]
-                logger.warning(f"[STEP 3] Sample problematic records (tx_id, customer_id, instance_id, customer_status, instance_status): {sample_details}")
+                )
+                SELECT 
+                    -- Total invalid (missing either customer or instance)
+                    COUNT(DISTINCT CASE WHEN customer_ref_id IS NULL OR membership_instance_ref_id IS NULL 
+                                   THEN membership_transactions_id END) as total_invalid_transactions,
+                    
+                    -- Missing customer dependencies
+                    COUNT(DISTINCT CASE WHEN customer_ref_id IS NULL 
+                                   THEN membership_transactions_id END) as missing_customer_transactions,
+                    
+                    -- Missing instance dependencies
+                    COUNT(DISTINCT CASE WHEN membership_instance_ref_id IS NULL 
+                                   THEN membership_transactions_id END) as missing_instance_transactions,
+                    
+                    -- NULL customer_ids
+                    COUNT(CASE WHEN customer_id IS NULL THEN 1 END) as null_customer_transactions,
+                    
+                    -- NULL membership_instances_ids
+                    COUNT(CASE WHEN membership_instances_id IS NULL THEN 1 END) as null_instance_transactions,
+                    
+                    -- Distinct missing customers (excluding NULLs)
+                    COUNT(DISTINCT CASE WHEN customer_id IS NOT NULL AND customer_ref_id IS NULL 
+                                   THEN customer_id END) as distinct_missing_customers,
+                    
+                    -- Distinct missing instances (excluding NULLs)
+                    COUNT(DISTINCT CASE WHEN membership_instances_id IS NOT NULL AND membership_instance_ref_id IS NULL 
+                                   THEN membership_instances_id END) as distinct_missing_instances,
+                    
+                    -- Sample problematic records (JSON)
+                    (SELECT json_agg(json_build_object(
+                        'membership_transactions_id', membership_transactions_id,
+                        'customer_id', customer_id,
+                        'membership_instances_id', membership_instances_id,
+                        'customer_status', customer_status,
+                        'instance_status', instance_status
+                    ))
+                     FROM (
+                        SELECT membership_transactions_id, customer_id, membership_instances_id, 
+                               customer_status, instance_status
+                        FROM dependency_analysis
+                        WHERE customer_ref_id IS NULL OR membership_instance_ref_id IS NULL
+                        ORDER BY membership_transactions_id
+                        LIMIT 10
+                     ) sample) as sample_problematic_records
+                FROM dependency_analysis
+            """), {"account_id": account_id, "location_id": location_id})
+            
+            row = result.fetchone()
+            total_invalid_transactions = int(row[0])
+            missing_customer_transactions = int(row[1])
+            missing_instance_transactions = int(row[2])
+            null_customer_transactions = int(row[3])
+            null_instance_transactions = int(row[4])
+            distinct_missing_customers = int(row[5])
+            distinct_missing_instances = int(row[6])
+            sample_problematic_records = row[7]  # JSON array
         
-        logger.info(f"[STEP 3] SUCCESS: Total invalid membership_transactions records: {total_invalid_transactions}")
-        logger.info(f"[STEP 3] SUCCESS: Customer dependency issues: {missing_customer_transactions}")
-        logger.info(f"[STEP 3] SUCCESS: Membership_instances dependency issues: {missing_instance_transactions}")
-        logger.info(f"[STEP 3] SUCCESS: NULL customer_id records: {null_customer_transactions}")
-        logger.info(f"[STEP 3] SUCCESS: NULL membership_instances_id records: {null_instance_transactions}")
-        logger.info(f"[STEP 3] SUCCESS: Distinct missing customers: {distinct_missing_customers}")
-        logger.info(f"[STEP 3] SUCCESS: Distinct missing membership_instances: {distinct_missing_instances}")
+        # Log detailed dependency information
+        if total_invalid_transactions > 0:
+            logger.warning(f"[STEP 4] Found {total_invalid_transactions} membership_transactions records with missing dependencies")
+            logger.warning(f"[STEP 4] Customer dependency issues: {missing_customer_transactions} records")
+            logger.warning(f"[STEP 4] Membership_instances dependency issues: {missing_instance_transactions} records")
+            logger.warning(f"[STEP 4] NULL customer_id: {null_customer_transactions} records")
+            logger.warning(f"[STEP 4] NULL membership_instances_id: {null_instance_transactions} records")
+            logger.warning(f"[STEP 4] Distinct missing customers: {distinct_missing_customers}")
+            logger.warning(f"[STEP 4] Distinct missing membership_instances: {distinct_missing_instances}")
+            
+            # Parse and log sample (already fetched from main query)
+            if sample_problematic_records:
+                import json
+                sample_details = [
+                    (item['membership_transactions_id'], item['customer_id'], 
+                     item['membership_instances_id'], item['customer_status'], 
+                     item['instance_status'])
+                    for item in json.loads(sample_problematic_records)
+                ]
+                logger.warning(f"[STEP 4] Sample problematic records (tx_id, customer_id, instance_id, customer_status, instance_status): {sample_details}")
+        
+        logger.info(f"[STEP 4] SUCCESS: Total invalid membership_transactions records: {total_invalid_transactions}")
+        logger.info(f"[STEP 4] SUCCESS: Customer dependency issues: {missing_customer_transactions}")
+        logger.info(f"[STEP 4] SUCCESS: Membership_instances dependency issues: {missing_instance_transactions}")
+        logger.info(f"[STEP 4] SUCCESS: NULL customer_id records: {null_customer_transactions}")
+        logger.info(f"[STEP 4] SUCCESS: NULL membership_instances_id records: {null_instance_transactions}")
+        logger.info(f"[STEP 4] SUCCESS: Distinct missing customers: {distinct_missing_customers}")
+        logger.info(f"[STEP 4] SUCCESS: Distinct missing membership_instances: {distinct_missing_instances}")
         
         return total_invalid_transactions
     except Exception as e:
-        logger.error(f"[STEP 3] ERROR: Failed to count membership_transactions with missing dependencies: {e}")
+        logger.error(f"[STEP 4] ERROR: Failed to count membership_transactions with missing dependencies: {e}")
         raise
 
 async def step_5_calculate_expected_ready(account_id: str, location_id: int, total_staging_after_cleanup: int, already_exist_in_main: int, invalid_dependency_records: int):
@@ -346,29 +310,34 @@ async def step_5_calculate_expected_ready(account_id: str, location_id: int, tot
 async def step_6_count_records_to_insert(account_id: str, location_id: int, engine):
     """
     Step 6: Count records that are actually ready for insertion (validation before insert)
-    This should match the expected_ready count - if not, there's a logic error
+    OPTIMIZED: Uses LEFT JOIN + IS NULL instead of NOT IN for better performance
     """
     logger.info(f"[STEP 6] Counting records ready for insertion (validation)")
     
     try:
         with engine.begin() as conn:
+            # ✅ OPTIMIZED: LEFT JOIN instead of NOT IN
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_membership_transactions_details_dlk mt
-                INNER JOIN customers c ON mt.customer_id = c.customer_id  
-                                    and c.account_id = :account_id
-                                    and c.location_id = :location_id
-                INNER JOIN membership_instances mi ON mt.membership_instances_id = mi.membership_instances_id 
-                        and mt.location = mi.location 
-                        and mt.account_id = mi.account_id
-                        and mi.account_id = :account_id
-                        and mi.location = :location_id
+                INNER JOIN customers c 
+                    ON c.customer_id = mt.customer_id  
+                    AND c.account_id = :account_id
+                    AND c.location_id = :location_id
+                INNER JOIN membership_instances mi 
+                    ON mi.membership_instances_id = mt.membership_instances_id 
+                    AND mi.location = mt.location 
+                    AND mi.account_id = mt.account_id
+                    AND mi.account_id = :account_id
+                    AND mi.location = :location_id
+                LEFT JOIN public.membership_transactions mtr
+                    ON mtr.membership_transactions_id = mt.membership_transactions_id
+                    AND mtr.account_id = mt.account_id
+                    AND mtr.location = mt.location
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
                   AND mt.isin_reservation = true
-                  AND mt.membership_transactions_id NOT IN (
-                    SELECT membership_transactions_id FROM public.membership_transactions WHERE account_id = :account_id AND location = :location_id
-                  )
+                  AND mtr.membership_transactions_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             insert_ready_count = result.fetchone()[0]
             
@@ -499,11 +468,11 @@ async def process_membership_transactions(account_id: str, location_id: int, eng
             logger.info(f"[process_membership_transactions] SUCCESS: Validation passed - {insert_ready_count} records ready for insertion as expected")
             
             # Step 7: Insert valid records (commented out for now)
-            # try:
-            #     inserted_records = await step_7_insert_valid_records(account_id, location_id, engine)
-            # except Exception as e:
-            #     logger.error(f"[process_membership_transactions] ERROR: Step 7 failed: {e}")
-            #     raise
+            try:
+                inserted_records = await step_7_insert_valid_records(account_id, location_id, engine)
+            except Exception as e:
+                logger.error(f"[process_membership_transactions] ERROR: Step 7 failed: {e}")
+                raise
         else:
             logger.warning(f"[process_membership_transactions] WARNING: No records to insert (expected_ready: {expected_ready})")
             insert_ready_count = 0

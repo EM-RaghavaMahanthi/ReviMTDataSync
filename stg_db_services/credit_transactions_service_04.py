@@ -126,60 +126,47 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
 async def step_3_count_transactions_with_missing_customers(account_id: str, location_id: int, engine):
     """
     Step 3: Count credit_transactions records with missing customer dependencies (invalid for insertion)
-    Also counts the number of distinct missing customers for insights
+    OPTIMIZED: Single query with LEFT JOIN instead of 4 queries with NOT EXISTS
     """
     logger.info(f"[STEP 3] Counting credit_transactions records with missing customer dependencies")
     
     try:
-        with engine.begin() as conn:
-            # Count credit_transactions records where customer_id is NULL or doesn't exist in customers table
+        with engine.begin() as conn:  # ✅ Single connection for all queries
+            # ✅ OPTIMIZED: Single query with LEFT JOIN gets ALL metrics at once!
             result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_credit_transactions_details_dlk stg
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND (
-                    stg.customer_id IS NULL
-                    OR NOT EXISTS (
-                      SELECT 1 FROM customers c 
-                      WHERE c.customer_id = stg.customer_id 
+                WITH missing_customers AS (
+                    SELECT 
+                        stg.customer_id,
+                        COUNT(*) as transaction_count
+                    FROM mt_credit_transactions_details_dlk stg
+                    LEFT JOIN customers c ON c.customer_id = stg.customer_id 
                         AND c.account_id = stg.account_id 
                         AND c.location_id = :location_id
-                    )
-                  )
+                    WHERE stg.account_id = :account_id
+                      AND stg.location = :location_id
+                      AND stg.isin_reservation = true
+                      AND c.customer_id IS NULL  -- Customer not found
+                    GROUP BY stg.customer_id
+                )
+                SELECT 
+                    COALESCE(SUM(transaction_count), 0) as total_missing_transactions,
+                    COUNT(DISTINCT customer_id) as distinct_missing_customers,
+                    COALESCE(SUM(CASE WHEN customer_id IS NULL THEN transaction_count ELSE 0 END), 0) as null_customer_transactions,
+                    (SELECT json_agg(json_build_object('customer_id', customer_id, 'transaction_count', transaction_count))
+                     FROM (
+                        SELECT customer_id, transaction_count 
+                        FROM missing_customers 
+                        ORDER BY transaction_count DESC 
+                        LIMIT 10
+                    ) t) as sample_missing_customers
+                FROM missing_customers
             """), {"account_id": account_id, "location_id": location_id})
-            missing_customer_transactions_count = result.fetchone()[0]
             
-            # Count distinct missing customers (excluding NULL values from distinct count)
-            distinct_result = conn.execute(text("""
-                SELECT COUNT(DISTINCT stg.customer_id) as count
-                FROM mt_credit_transactions_details_dlk stg
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND (
-                    stg.customer_id IS NULL
-                    OR NOT EXISTS (
-                      SELECT 1 FROM customers c 
-                      WHERE c.customer_id = stg.customer_id 
-                        AND c.account_id = stg.account_id 
-                        AND c.location_id = :location_id
-                    )
-                  )
-            """), {"account_id": account_id, "location_id": location_id})
-            distinct_missing_customers = distinct_result.fetchone()[0]
-            
-            # Also count NULL customer_ids separately for insights
-            null_result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_credit_transactions_details_dlk stg
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.isin_reservation = true
-                  AND stg.customer_id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            null_customer_transactions = null_result.fetchone()[0]
+            row = result.fetchone()
+            missing_customer_transactions_count = int(row[0])
+            distinct_missing_customers = int(row[1])
+            null_customer_transactions = int(row[2])
+            sample_missing_customers = row[3]  # Already a Python list/dict, not JSON string
             
         # Log details about missing customers if any
         if missing_customer_transactions_count > 0:
@@ -187,28 +174,10 @@ async def step_3_count_transactions_with_missing_customers(account_id: str, loca
             logger.warning(f"[STEP 3] Found {distinct_missing_customers} distinct missing customers")
             logger.warning(f"[STEP 3] Found {null_customer_transactions} credit_transactions records with NULL customer_id")
             
-            # Get sample of missing customer_ids and their transaction counts for debugging
-            with engine.begin() as conn:
-                sample_result = conn.execute(text("""
-                    SELECT stg.customer_id, COUNT(*) as transaction_count
-                    FROM mt_credit_transactions_details_dlk stg
-                    WHERE stg.account_id = :account_id
-                      AND stg.location = :location_id
-                      AND stg.isin_reservation = true
-                      AND (
-                        stg.customer_id IS NULL
-                        OR NOT EXISTS (
-                          SELECT 1 FROM customers c 
-                          WHERE c.customer_id = stg.customer_id 
-                            AND c.account_id = stg.account_id 
-                            AND c.location_id = :location_id
-                        )
-                      )
-                    GROUP BY stg.customer_id
-                    ORDER BY transaction_count DESC
-                    LIMIT 10
-                """), {"account_id": account_id, "location_id": location_id})
-                missing_details = [(row[0], row[1]) for row in sample_result.fetchall()]
+            # Parse and log sample (NO json.loads needed - it's already parsed!)
+            if sample_missing_customers:
+                missing_details = [(item['customer_id'], item['transaction_count']) 
+                                   for item in sample_missing_customers]  # Remove json.loads()
                 logger.warning(f"[STEP 3] Sample missing customers with transaction counts: {missing_details}")
         
         logger.info(f"[STEP 3] SUCCESS: Credit_transactions records with missing customers: {missing_customer_transactions_count}")

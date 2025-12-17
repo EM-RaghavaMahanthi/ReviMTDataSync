@@ -183,9 +183,10 @@ async def step_3_count_records_with_missing_dependencies(account_id: str, locati
         logger.error(f"[STEP 3] ERROR: Failed to count credit_transactions reservation records with missing dependencies: {e}")
         raise
 
-async def step_4_count_records_ready_for_insertion(account_id: str, location_id: int, engine):
+async def step_4_count_records_ready_for_insertion(account_id: str, location_id: str, engine):
     """
     Step 4: Count credit_transactions reservation records that are actually ready for insertion (validation before insert)
+    OPTIMIZED: Uses EXISTS/NOT EXISTS for better performance
     """
     logger.info(f"[STEP 4] Counting credit_transactions reservation records ready for insertion (validation)")
     
@@ -194,27 +195,34 @@ async def step_4_count_records_ready_for_insertion(account_id: str, location_id:
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_reservations_details_dlk stg
-                INNER JOIN customers c
-                  ON stg.customer_id = c.customer_id
-                  AND c.account_id = :account_id
-                  AND c.location_id = :location_id
-                INNER JOIN class_sessions cs
-                  ON stg.class_session_id = cs.class_session_id
-                  AND cs.account_id = :account_id
-                  AND cs.location = :location_id
-                INNER JOIN credit_transactions ct
-                  ON stg.credit_transactions_id = ct.credit_transactions_id
-                  AND ct.account_id = :account_id
-                  AND ct.location = :location_id
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.credit_transactions_id IS NOT NULL
-                  AND stg.reservations_id NOT IN (
-                    SELECT reservations_id FROM reservations 
-                    WHERE account_id = :account_id 
-                      AND location = :location_id
+                  AND EXISTS (
+                    SELECT 1 FROM customers c
+                    WHERE c.customer_id = stg.customer_id
+                      AND c.account_id = :account_id
+                      AND c.location_id = :location_id
                   )
-            """), {"account_id": account_id, "location_id": str(location_id)})
+                  AND EXISTS (
+                    SELECT 1 FROM class_sessions cs
+                    WHERE cs.class_session_id = stg.class_session_id
+                      AND cs.account_id = :account_id
+                      AND cs.location = :location_id
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM credit_transactions ct
+                    WHERE ct.credit_transactions_id = stg.credit_transactions_id
+                      AND ct.account_id = :account_id
+                      AND ct.location = :location_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM reservations r
+                    WHERE r.reservations_id = stg.reservations_id
+                      AND r.account_id = :account_id
+                      AND r.location = :location_id
+                  )
+            """), {"account_id": account_id, "location_id": location_id})
             insert_ready_count = result.fetchone()[0]
             
         logger.info(f"[STEP 4] SUCCESS: Credit_transactions reservation records ready for insertion: {insert_ready_count}")
@@ -222,6 +230,7 @@ async def step_4_count_records_ready_for_insertion(account_id: str, location_id:
     except Exception as e:
         logger.error(f"[STEP 4] ERROR: Failed to count credit_transactions reservation records ready for insertion: {e}")
         raise
+
 
 async def step_5_insert_new_records(account_id: str, location_id: int, engine):
     """

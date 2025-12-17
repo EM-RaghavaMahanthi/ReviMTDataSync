@@ -162,33 +162,41 @@ async def step_3_count_records_with_missing_dependencies(account_id: str, locati
         logger.error(f"[STEP 3] ERROR: Failed to count missing dependencies: {e}")
         raise
 
-async def step_4_count_records_ready_for_insertion(account_id: str, location_id: int, engine):
+async def step_4_count_records_ready_for_insertion(account_id: str, location_id: str, engine):
     """
     Step 4: Count no-transactions reservation records ready for insertion (have all dependencies and not already in main table)
+    OPTIMIZED: Uses EXISTS/NOT EXISTS for better performance
     """
     logger.info(f"[STEP 4] Counting no-transactions reservation records ready for insertion")
     
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
-                SELECT COUNT(DISTINCT mt.reservations_id) as count
-                FROM mt_reservations_details_dlk mt
-                INNER JOIN customers c
-                        ON mt.customer_id = c.customer_id
-                       AND c.account_id = :account_id
-                       AND c.location_id = :location_id
-                INNER JOIN class_sessions cs
-                        ON mt.class_session_id = cs.class_session_id
-                       AND cs.account_id = :account_id
-                       AND cs.location = :location_id
-                WHERE mt.account_id = :account_id
-                  AND mt.location = :location_id
-                  AND mt.credit_transactions_id IS NULL
-                  AND mt.membership_transactions_id IS NULL
-                  AND mt.reservations_id NOT IN (
-                    SELECT reservations_id FROM public.reservations WHERE account_id = :account_id AND location = :location_id
+                SELECT COUNT(DISTINCT stg.reservations_id) as count
+                FROM mt_reservations_details_dlk stg
+                WHERE stg.account_id = :account_id
+                  AND stg.location = :location_id
+                  AND stg.credit_transactions_id IS NULL
+                  AND stg.membership_transactions_id IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM customers c
+                    WHERE c.customer_id = stg.customer_id
+                      AND c.account_id = :account_id
+                      AND c.location_id = :location_id
                   )
-            """), {"account_id": account_id, "location_id": str(location_id)})
+                  AND EXISTS (
+                    SELECT 1 FROM class_sessions cs
+                    WHERE cs.class_session_id = stg.class_session_id
+                      AND cs.account_id = :account_id
+                      AND cs.location = :location_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM public.reservations r
+                    WHERE r.reservations_id = stg.reservations_id
+                      AND r.account_id = :account_id
+                      AND r.location = :location_id
+                  )
+            """), {"account_id": account_id, "location_id": location_id})
             ready_count = result.fetchone()[0]
         
         logger.info(f"[STEP 4] SUCCESS: No-transactions reservation records ready for insertion: {ready_count}")
@@ -197,9 +205,11 @@ async def step_4_count_records_ready_for_insertion(account_id: str, location_id:
         logger.error(f"[STEP 4] ERROR: Failed to count records ready for insertion: {e}")
         raise
 
-async def step_5_insert_new_records(account_id: str, location_id: int, engine):
+
+async def step_5_insert_new_records(account_id: str, location_id: str, engine):
     """
     Step 5: Insert new no-transactions reservation records into main table
+    OPTIMIZED: Uses NOT EXISTS for better performance
     """
     logger.info(f"[STEP 5] Inserting new no-transactions reservation records")
     
@@ -213,28 +223,33 @@ async def step_5_insert_new_records(account_id: str, location_id: int, engine):
                   class_session_id, reservation_type, account_id, class_session_ref_id, credit_transactions_ref_id,
                   customer_ref_id, membership_transactions_ref_id, prev_reservation_type
                 )
-                SELECT mt.reservations_id, mt.cancel_date, mt.check_in_date, mt.creation_date, mt.status, mt.credit_transactions_type,
-                       mt.credit_transactions_id, mt.membership_transactions_type, mt.membership_transactions_id, mt.guest, mt.customer_id,
-                       mt.location, now() AS created_at, 1 AS created_by, now() AS updated_at, mt.updated_by, mt.deleted_at, mt.deleted_by,
-                       mt.first_timer, mt.class_session_id, mt.reservation_type, mt.account_id, cs.id AS class_session_ref_id,
-                       NULL AS credit_transactions_ref_id, c.id AS customer_ref_id, NULL AS membership_transactions_ref_id, mt.reservation_type as prev_reservation_type
-                FROM mt_reservations_details_dlk mt
+                SELECT 
+                  stg.reservations_id, stg.cancel_date, stg.check_in_date, stg.creation_date, stg.status, stg.credit_transactions_type,
+                  stg.credit_transactions_id, stg.membership_transactions_type, stg.membership_transactions_id, stg.guest, stg.customer_id,
+                  stg.location, now() AS created_at, 1 AS created_by, now() AS updated_at, stg.updated_by, stg.deleted_at, stg.deleted_by,
+                  stg.first_timer, stg.class_session_id, stg.reservation_type, stg.account_id, cs.id AS class_session_ref_id,
+                  NULL AS credit_transactions_ref_id, c.id AS customer_ref_id, NULL AS membership_transactions_ref_id, 
+                  stg.reservation_type as prev_reservation_type
+                FROM mt_reservations_details_dlk stg
                 INNER JOIN customers c
-                        ON mt.customer_id = c.customer_id
-                       AND c.account_id = :account_id
-                       AND c.location_id = :location_id
+                  ON c.customer_id = stg.customer_id
+                  AND c.account_id = :account_id
+                  AND c.location_id = :location_id
                 INNER JOIN class_sessions cs
-                        ON mt.class_session_id = cs.class_session_id
-                       AND cs.account_id = :account_id
-                       AND cs.location = :location_id
-                WHERE mt.account_id = :account_id
-                  AND mt.location = :location_id
-                  AND mt.credit_transactions_id IS NULL
-                  AND mt.membership_transactions_id IS NULL
-                  AND mt.reservations_id NOT IN (
-                    SELECT reservations_id FROM public.reservations WHERE account_id = :account_id AND location = :location_id
+                  ON cs.class_session_id = stg.class_session_id
+                  AND cs.account_id = :account_id
+                  AND cs.location = :location_id
+                WHERE stg.account_id = :account_id
+                  AND stg.location = :location_id
+                  AND stg.credit_transactions_id IS NULL
+                  AND stg.membership_transactions_id IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM public.reservations r
+                    WHERE r.reservations_id = stg.reservations_id
+                      AND r.account_id = :account_id
+                      AND r.location = :location_id
                   )
-            """), {"account_id": account_id, "location_id": str(location_id)})
+            """), {"account_id": account_id, "location_id": location_id})
             
             inserted_count = result.rowcount
         

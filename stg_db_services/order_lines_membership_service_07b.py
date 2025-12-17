@@ -103,35 +103,34 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
     Step 2: Count MembershipTransaction order_lines records already existing in main table
-    Uses membership_transactions_ref_id matching for consistency with insertion logic
+    OPTIMIZED: Uses INNER JOIN instead of EXISTS for better performance
     """
     logger.info(f"[STEP 2] Counting MembershipTransaction order_lines records already in main table")
     
     try:
         with engine.begin() as conn:
+            # ✅ OPTIMIZED: INNER JOIN instead of EXISTS
             result = conn.execute(text("""
                 WITH candidate_rows AS (
-                  SELECT DISTINCT ON (mto.id)
-                    mto.id AS membership_transactions_ref_id
-                  FROM mt_order_lines_details_dlk stg
-                  INNER JOIN membership_transactions_orders mto
-                    ON stg.membership_transactions_id = mto.membership_transactions_id
-                    AND mto.account_id = :account_id
-                    AND mto.location = :location_id
-                  INNER JOIN orders o
-                    ON stg.order_id = o.order_id
-                    AND o.account_id = :account_id
-                  WHERE stg.account_id = :account_id
-                    AND stg.location = :location_id
-                    AND stg.transaction_type = 'MembershipTransaction'
-                  ORDER BY mto.id, stg.updated_at DESC
+                    SELECT DISTINCT ON (mto.id)
+                        mto.id AS membership_transactions_ref_id
+                    FROM mt_order_lines_details_dlk stg
+                    INNER JOIN membership_transactions_orders mto
+                        ON mto.membership_transactions_id = stg.membership_transactions_id
+                        AND mto.account_id = :account_id
+                        AND mto.location = :location_id
+                    INNER JOIN orders o
+                        ON o.order_id = stg.order_id
+                        AND o.account_id = :account_id
+                    WHERE stg.account_id = :account_id
+                        AND stg.location = :location_id
+                        AND stg.transaction_type = 'MembershipTransaction'
+                    ORDER BY mto.id, stg.updated_at DESC
                 )
                 SELECT COUNT(*)
                 FROM candidate_rows cr
-                WHERE EXISTS (
-                  SELECT 1 FROM order_lines ol
-                  WHERE ol.membership_transactions_ref_id = cr.membership_transactions_ref_id
-                )
+                INNER JOIN order_lines ol 
+                    ON ol.membership_transactions_ref_id = cr.membership_transactions_ref_id
             """), {"account_id": account_id, "location_id": str(location_id)})
             existing_count = result.fetchone()[0]
         
@@ -153,55 +152,43 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
 async def step_4_count_order_lines_with_missing_dependencies(account_id: str, location_id: int, engine):
     """
     Step 4: Count MembershipTransaction order_lines records with missing dependencies
-    Uses DISTINCT ON to match insertion logic - calculates invalid by subtracting valid from total unique
+    OPTIMIZED: Single query with LEFT JOIN instead of 2 separate queries
     """
     logger.info(f"[STEP 4] Counting MembershipTransaction order_lines records with missing dependencies")
     
     try:
         with engine.begin() as conn:
-            # Count total unique records (same as Step 1 logic)
-            total_unique_result = conn.execute(text("""
-                SELECT COUNT(*)
-                FROM (
-                  SELECT DISTINCT ON (mto.id)
-                    stg.order_line_id
-                  FROM mt_order_lines_details_dlk stg
-                  INNER JOIN membership_transactions_orders mto
-                    ON stg.membership_transactions_id = mto.membership_transactions_id
-                    AND mto.account_id = :account_id
-                    AND mto.location = :location_id
-                  WHERE stg.account_id = :account_id
-                    AND stg.location = :location_id
-                    AND stg.transaction_type = 'MembershipTransaction'
-                  ORDER BY mto.id, stg.updated_at DESC
-                ) unique_records
-            """), {"account_id": account_id, "location_id": str(location_id)})
-            total_unique_count = total_unique_result.fetchone()[0]
-            
-            # Count records with valid dependencies (both orders and membership_transactions_orders exist)
-            valid_dependencies_result = conn.execute(text("""
-                SELECT COUNT(*)
-                FROM (
-                  SELECT DISTINCT ON (mto.id)
-                    stg.order_line_id
-                  FROM mt_order_lines_details_dlk stg
-                  INNER JOIN membership_transactions_orders mto
-                    ON stg.membership_transactions_id = mto.membership_transactions_id
-                    AND mto.account_id = :account_id
-                    AND mto.location = :location_id
-                  INNER JOIN orders o
-                    ON stg.order_id = o.order_id
+            # ✅ OPTIMIZED: Single query gets all metrics at once!
+            result = conn.execute(text("""
+                WITH unique_records AS (
+                    SELECT DISTINCT ON (mto.id)
+                        stg.order_line_id,
+                        mto.id AS membership_transactions_ref_id,
+                        stg.order_id
+                    FROM mt_order_lines_details_dlk stg
+                    INNER JOIN membership_transactions_orders mto
+                        ON mto.membership_transactions_id = stg.membership_transactions_id
+                        AND mto.account_id = :account_id
+                        AND mto.location = :location_id
+                    WHERE stg.account_id = :account_id
+                        AND stg.location = :location_id
+                        AND stg.transaction_type = 'MembershipTransaction'
+                    ORDER BY mto.id, stg.updated_at DESC
+                )
+                SELECT 
+                    COUNT(*) as total_unique_count,
+                    COUNT(o.order_id) as valid_dependencies_count,
+                    COUNT(*) - COUNT(o.order_id) as invalid_dependencies_count
+                FROM unique_records ur
+                LEFT JOIN orders o 
+                    ON o.order_id = ur.order_id
                     AND o.account_id = :account_id
-                  WHERE stg.account_id = :account_id
-                    AND stg.location = :location_id
-                    AND stg.transaction_type = 'MembershipTransaction'
-                  ORDER BY mto.id, stg.updated_at DESC
-                ) valid_records
             """), {"account_id": account_id, "location_id": str(location_id)})
-            valid_dependencies_count = valid_dependencies_result.fetchone()[0]
             
-            # Calculate invalid dependencies
-            invalid_dependencies_count = total_unique_count - valid_dependencies_count
+            row = result.fetchone()
+            total_unique_count = int(row[0])
+            valid_dependencies_count = int(row[1])
+            invalid_dependencies_count = int(row[2])
             
         logger.info(f"[STEP 4] SUCCESS: Total unique records: {total_unique_count}")
         logger.info(f"[STEP 4] SUCCESS: Valid dependencies: {valid_dependencies_count}")
@@ -229,36 +216,36 @@ async def step_5_calculate_expected_ready(account_id: str, location_id: int, tot
 async def step_6_count_records_to_insert(account_id: str, location_id: int, engine):
     """
     Step 6: Count MembershipTransaction order_lines records ready for insertion
-    Uses DISTINCT ON and WHERE NOT EXISTS to match exact INSERT logic
+    OPTIMIZED: Uses LEFT JOIN + IS NULL instead of NOT EXISTS for better performance
     """
     logger.info(f"[STEP 6] Counting MembershipTransaction order_lines records ready for insertion")
     
     try:
         with engine.begin() as conn:
+            # ✅ OPTIMIZED: LEFT JOIN instead of NOT EXISTS
             result = conn.execute(text("""
                 WITH candidate_rows AS (
-                  SELECT DISTINCT ON (mto.id)
-                    stg.order_line_id,
-                    mto.id AS membership_transactions_ref_id
-                  FROM mt_order_lines_details_dlk stg
-                  INNER JOIN membership_transactions_orders mto
-                    ON stg.membership_transactions_id = mto.membership_transactions_id
-                    AND mto.account_id = :account_id
-                    AND mto.location = :location_id
-                  INNER JOIN orders o
-                    ON stg.order_id = o.order_id
-                    AND o.account_id = :account_id
-                  WHERE stg.account_id = :account_id
-                    AND stg.location = :location_id
-                    AND stg.transaction_type = 'MembershipTransaction'
-                  ORDER BY mto.id, stg.updated_at DESC
+                    SELECT DISTINCT ON (mto.id)
+                        stg.order_line_id,
+                        mto.id AS membership_transactions_ref_id
+                    FROM mt_order_lines_details_dlk stg
+                    INNER JOIN membership_transactions_orders mto
+                        ON mto.membership_transactions_id = stg.membership_transactions_id
+                        AND mto.account_id = :account_id
+                        AND mto.location = :location_id
+                    INNER JOIN orders o
+                        ON o.order_id = stg.order_id
+                        AND o.account_id = :account_id
+                    WHERE stg.account_id = :account_id
+                        AND stg.location = :location_id
+                        AND stg.transaction_type = 'MembershipTransaction'
+                    ORDER BY mto.id, stg.updated_at DESC
                 )
                 SELECT COUNT(*)
                 FROM candidate_rows cr
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM order_lines ol
-                  WHERE ol.membership_transactions_ref_id = cr.membership_transactions_ref_id
-                )
+                LEFT JOIN order_lines ol 
+                    ON ol.membership_transactions_ref_id = cr.membership_transactions_ref_id
+                WHERE ol.membership_transactions_ref_id IS NULL
             """), {"account_id": account_id, "location_id": str(location_id)})
             ready_count = result.fetchone()[0]
         

@@ -93,23 +93,24 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
 async def step_2_count_existing_in_main_table(account_id: str, location_id: int, engine):
     """
     Step 2: Count Other transaction order_lines records already existing in main table
+    OPTIMIZED: Uses INNER JOIN instead of IN subquery for better performance
     """
     logger.info(f"[STEP 2] Counting Other transaction order_lines records already in main table")
     
     try:
         with engine.begin() as conn:
+            # ✅ OPTIMIZED: INNER JOIN instead of IN subquery
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_order_lines_details_dlk stg
+                INNER JOIN order_lines ol 
+                    ON ol.order_line_id = stg.order_line_id
+                    AND ol.account_id = stg.account_id
+                    AND ol.location = stg.location
+                    AND ol.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                  AND stg.order_line_id IN (
-                    SELECT order_line_id FROM order_lines 
-                    WHERE account_id = :account_id 
-                      AND location = :location_id
-                      AND transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                  )
             """), {"account_id": account_id, "location_id": str(location_id)})
             existing_count = result.fetchone()[0]
         
@@ -150,29 +151,43 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
 async def step_4_count_order_lines_with_missing_dependencies(account_id: str, location_id: int, engine):
     """
     Step 4: Count Other transaction order_lines records with missing dependencies (invalid for insertion)
-    Dependencies: orders table only (single dependency validation)
+    OPTIMIZED: Single query with LEFT JOIN instead of 2 queries with NOT EXISTS
     """
     logger.info(f"[STEP 4] Counting Other transaction order_lines records with missing dependencies")
     
     try:
-        with engine.begin() as conn:
-            # Count records with missing orders (only dependency for Other transaction types)
-            missing_orders_result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_order_lines_details_dlk stg
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                  AND (
-                    stg.order_id IS NULL
-                    OR NOT EXISTS (
-                      SELECT 1 FROM orders o 
-                      WHERE o.order_id = stg.order_id 
+        with engine.begin() as conn:  # ✅ Single connection
+            # ✅ OPTIMIZED: Single query with LEFT JOIN gets all metrics at once!
+            result = conn.execute(text("""
+                WITH missing_orders AS (
+                    SELECT 
+                        stg.order_id,
+                        COUNT(*) as order_line_count
+                    FROM mt_order_lines_details_dlk stg
+                    LEFT JOIN orders o 
+                        ON o.order_id = stg.order_id 
                         AND o.account_id = :account_id
-                    )
-                  )
+                    WHERE stg.account_id = :account_id
+                      AND stg.location = :location_id
+                      AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                      AND o.order_id IS NULL  -- Order not found
+                    GROUP BY stg.order_id
+                )
+                SELECT 
+                    COALESCE(SUM(order_line_count), 0) as total_missing_orders,
+                    (SELECT json_agg(json_build_object('order_id', order_id, 'order_line_count', order_line_count))
+                     FROM (
+                        SELECT order_id, order_line_count 
+                        FROM missing_orders 
+                        ORDER BY order_line_count DESC 
+                        LIMIT 10
+                    ) t) as sample_missing_orders
+                FROM missing_orders
             """), {"account_id": account_id, "location_id": str(location_id)})
-            missing_orders_count = missing_orders_result.fetchone()[0]
+            
+            row = result.fetchone()
+            missing_orders_count = int(row[0])
+            sample_missing_orders = row[1]  # Already a Python list/dict, not JSON string
             
             # For Other transaction types, only orders dependency matters
             total_invalid_dependencies = missing_orders_count
@@ -182,30 +197,11 @@ async def step_4_count_order_lines_with_missing_dependencies(account_id: str, lo
             logger.warning(f"[STEP 4] Found {total_invalid_dependencies} Other transaction order_lines records with missing dependencies")
             logger.warning(f"[STEP 4] Missing orders: {missing_orders_count}")
             
-            # Get sample of missing dependencies for debugging
-            with engine.begin() as conn:
-                # Sample missing orders
-                if missing_orders_count > 0:
-                    sample_orders_result = conn.execute(text("""
-                        SELECT stg.order_id, COUNT(*) as order_line_count
-                        FROM mt_order_lines_details_dlk stg
-                        WHERE stg.account_id = :account_id
-                          AND stg.location = :location_id
-                          AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                          AND (
-                            stg.order_id IS NULL
-                            OR NOT EXISTS (
-                              SELECT 1 FROM orders o 
-                              WHERE o.order_id = stg.order_id 
-                                AND o.account_id = :account_id
-                            )
-                          )
-                        GROUP BY stg.order_id
-                        ORDER BY order_line_count DESC
-                        LIMIT 10
-                    """), {"account_id": account_id, "location_id": str(location_id)})
-                    missing_orders_sample = [(row[0], row[1]) for row in sample_orders_result.fetchall()]
-                    logger.warning(f"[STEP 4] Sample missing order_ids with counts: {missing_orders_sample}")
+            # Parse and log sample (NO json.loads needed - it's already parsed!)
+            if sample_missing_orders:
+                missing_orders_sample = [(item['order_id'], item['order_line_count']) 
+                                        for item in sample_missing_orders]  # Remove json.loads()
+                logger.warning(f"[STEP 4] Sample missing order_ids with counts: {missing_orders_sample}")
         
         logger.info(f"[STEP 4] SUCCESS: Other transaction order_lines records with missing dependencies: {total_invalid_dependencies}")
         logger.info(f"[STEP 4] SUCCESS: Missing orders: {missing_orders_count}")
@@ -213,6 +209,7 @@ async def step_4_count_order_lines_with_missing_dependencies(account_id: str, lo
     except Exception as e:
         logger.error(f"[STEP 4] ERROR: Failed to count Other transaction order_lines with missing dependencies: {e}")
         raise
+
 
 async def step_5_calculate_expected_ready(account_id: str, location_id: int, total_staging_after_cleanup: int, already_exist_in_main: int, invalid_dependency_records: int):
     """
@@ -231,27 +228,28 @@ async def step_5_calculate_expected_ready(account_id: str, location_id: int, tot
 async def step_6_count_records_to_insert(account_id: str, location_id: int, engine):
     """
     Step 6: Count Other transaction order_lines records that are actually ready for insertion (validation before insert)
-    This should match the expected_ready count - if not, there's a logic error
+    OPTIMIZED: Uses LEFT JOIN + IS NULL instead of NOT IN for better performance
     """
     logger.info(f"[STEP 6] Counting Other transaction order_lines records ready for insertion (validation)")
     
     try:
         with engine.begin() as conn:
+            # ✅ OPTIMIZED: LEFT JOIN instead of NOT IN
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_order_lines_details_dlk stg
                 INNER JOIN orders o
-                  ON stg.order_id = o.order_id
-                  AND o.account_id = :account_id
+                    ON o.order_id = stg.order_id
+                    AND o.account_id = :account_id
+                LEFT JOIN order_lines ol 
+                    ON ol.order_line_id = stg.order_line_id
+                    AND ol.account_id = stg.account_id
+                    AND ol.location = stg.location
+                    AND ol.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                  AND stg.order_line_id NOT IN (
-                    SELECT order_line_id FROM order_lines 
-                    WHERE account_id = :account_id 
-                      AND location = :location_id
-                      AND transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                  )
+                  AND ol.order_line_id IS NULL
             """), {"account_id": account_id, "location_id": str(location_id)})
             insert_ready_count = result.fetchone()[0]
             

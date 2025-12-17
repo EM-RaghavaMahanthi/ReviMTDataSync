@@ -167,58 +167,36 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
 async def step_4_count_transactions_with_missing_dependencies(account_id: str, location_id: int, engine):
     """
     Step 4: Count membership_transactions records with missing dependencies (customers or membership_instances)
-    Uses LEFT JOIN to find records that cannot be inserted due to missing foreign key relationships
+    OPTIMIZED: Single query with LEFT JOIN instead of 3 separate queries
     """
     logger.info(f"[STEP 4] Counting membership_transactions records with missing dependencies")
     
     try:
-        with engine.begin() as conn:
-            # Count records with missing dependencies using LEFT JOIN approach
+        with engine.begin() as conn:  # ✅ Single connection
+            # ✅ OPTIMIZED: Single query gets ALL metrics at once!
             result = conn.execute(text("""
-                SELECT COUNT(*) as count
+                SELECT 
+                    COUNT(CASE WHEN c.customer_id IS NULL OR mi.membership_instances_id IS NULL 
+                               THEN 1 END) as total_missing_dependencies,
+                    COUNT(CASE WHEN c.customer_id IS NULL THEN 1 END) as missing_customers,
+                    COUNT(CASE WHEN mi.membership_instances_id IS NULL THEN 1 END) as missing_membership_instances
                 FROM mt_membership_transactions_details_dlk mt
-                LEFT JOIN customers c ON mt.customer_id = c.customer_id 
-                                      AND c.account_id = :account_id
-                LEFT JOIN membership_instances mi ON mt.membership_instances_id = mi.membership_instances_id 
-                                                  AND mt.location = mi.location 
-                                                  AND mt.account_id = mi.account_id
-                                                  AND mi.account_id = :account_id
-                                                  AND mi.location = :location_id
+                LEFT JOIN customers c ON c.customer_id = mt.customer_id 
+                    AND c.account_id = :account_id
+                LEFT JOIN membership_instances mi ON mi.membership_instances_id = mt.membership_instances_id 
+                    AND mi.location = mt.location 
+                    AND mi.account_id = mt.account_id
+                    AND mi.account_id = :account_id
+                    AND mi.location = :location_id
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
                   AND mt.isin_order_line = true
-                  AND (c.customer_id IS NULL OR mi.membership_instances_id IS NULL)
             """), {"account_id": account_id, "location_id": location_id})
-            missing_dependencies_count = result.fetchone()[0]
             
-            # Count records with missing customers specifically
-            customer_result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_membership_transactions_details_dlk mt
-                LEFT JOIN customers c ON mt.customer_id = c.customer_id 
-                                      AND c.account_id = :account_id
-                WHERE mt.account_id = :account_id
-                  AND mt.location = :location_id
-                  AND mt.isin_order_line = true
-                  AND c.customer_id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            missing_customers_count = customer_result.fetchone()[0]
-            
-            # Count records with missing membership_instances specifically
-            mi_result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_membership_transactions_details_dlk mt
-                LEFT JOIN membership_instances mi ON mt.membership_instances_id = mi.membership_instances_id 
-                                                  AND mt.location = mi.location 
-                                                  AND mt.account_id = mi.account_id
-                                                  AND mi.account_id = :account_id
-                                                  AND mi.location = :location_id
-                WHERE mt.account_id = :account_id
-                  AND mt.location = :location_id
-                  AND mt.isin_order_line = true
-                  AND mi.membership_instances_id IS NULL
-            """), {"account_id": account_id, "location_id": location_id})
-            missing_membership_instances_count = mi_result.fetchone()[0]
+            row = result.fetchone()
+            missing_dependencies_count = int(row[0])
+            missing_customers_count = int(row[1])
+            missing_membership_instances_count = int(row[2])
         
         # Log details about missing dependencies
         if missing_dependencies_count > 0:
@@ -251,26 +229,31 @@ async def step_5_calculate_expected_ready(account_id: str, location_id: int, tot
 async def step_6_count_records_to_insert(account_id: str, location_id: int, engine):
     """
     Step 6: Count records that are actually ready for insertion (validation before insert)
-    This should match the expected_ready count - if not, there's a logic error
+    OPTIMIZED: Uses LEFT JOIN + IS NULL instead of NOT IN for better performance
     """
     logger.info(f"[STEP 6] Counting records ready for insertion (validation)")
     
     try:
         with engine.begin() as conn:
+            # ✅ OPTIMIZED: LEFT JOIN instead of NOT IN
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_membership_transactions_details_dlk mt
                 INNER JOIN customers c 
-                ON mt.customer_id = c.customer_id  
-                AND mt.account_id = c.account_id
+                    ON c.customer_id = mt.customer_id  
+                    AND c.account_id = mt.account_id
                 INNER JOIN membership_instances mi 
-                ON mt.membership_instances_id = mi.membership_instances_id 
-                AND mt.location = mi.location 
-                AND mt.account_id = mi.account_id
+                    ON mi.membership_instances_id = mt.membership_instances_id 
+                    AND mi.location = mt.location 
+                    AND mi.account_id = mt.account_id
+                LEFT JOIN public.membership_transactions_orders mto
+                    ON mto.membership_transactions_id = mt.membership_transactions_id
+                    AND mto.account_id = mt.account_id
+                    AND mto.location = mt.location
                 WHERE mt.account_id = :account_id 
-                AND mt.location = :location_id
-                AND mt.isin_order_line = true
-                AND mt.membership_transactions_id NOT IN (SELECT membership_transactions_id FROM public.membership_transactions_orders WHERE account_id = :account_id AND location = :location_id)
+                  AND mt.location = :location_id
+                  AND mt.isin_order_line = true
+                  AND mto.membership_transactions_id IS NULL
             """), {"account_id": account_id, "location_id": location_id})
             insert_ready_count = result.fetchone()[0]
             
@@ -393,14 +376,14 @@ async def process_membership_transactions_orders(account_id: str, location_id: i
                 raise Exception(f"Insert ready count mismatch: expected {expected_ready}, actual {insert_ready_count}")
             
             logger.info(f"[process_membership_transactions_orders] SUCCESS: Validation passed - {insert_ready_count} records ready for insertion as expected")
-            
+
             # Step 7: Insert new records
-            # try:
-            #     inserted_records = await step_7_insert_new_records(account_id, location_id, engine)
-            # except Exception as e:
-            #     logger.error(f"[process_membership_transactions_orders] ERROR: Step 7 failed: {e}")
-            #     raise
-            
+            try:
+                inserted_records = await step_7_insert_new_records(account_id, location_id, engine)
+            except Exception as e:
+                logger.error(f"[process_membership_transactions_orders] ERROR: Step 7 failed: {e}")
+                raise
+
             # Final validation that insertion count matches expected
             if inserted_records == expected_ready:
                 logger.info(f"[process_membership_transactions_orders] SUCCESS: Final validation passed - inserted {inserted_records} records as expected")
