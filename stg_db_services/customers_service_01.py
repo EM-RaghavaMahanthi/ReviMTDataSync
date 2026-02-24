@@ -163,13 +163,13 @@ async def step_7_insert_new_records(account_id: str, location_id: int, engine):
         # Insert with DISTINCT to handle source duplicates automatically
         insert_sql = text("""
             INSERT INTO public.customers (
-              customer_id, location_id, account_id, first_name, last_name, email, full_name, birth_date,
+              customer_id, location_id, account_id, first_name, last_name, email, full_name, birth_date, birth_month, birth_day,
               phone_number, address_line1, address_line2, address_line3, city, country, state_province,
               customer_state, postal_code, gender, date_joined, is_opted_in_to_sms, completed_class_count,
               state_id, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by
             )
             SELECT DISTINCT
-              customer_id, location_id, account_id, first_name, last_name, email, full_name, birth_date,
+              customer_id, location_id, account_id, first_name, last_name, email, full_name, birth_date, birth_month, birth_day,
               phone_number, address_line1, address_line2, address_line3, city, country, state_province,
               customer_state, postal_code, gender, date_joined, is_opted_in_to_sms, completed_class_count,
               state_id, NOW() AS created_at, 1 AS created_by, NOW() AS updated_at, updated_by, deleted_at, deleted_by

@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     CONNECTION_TIMEOUT: int = 300  # 5 minutes
     READ_TIMEOUT: int = 120  # 2 minutes
     
+    # Lambda Settings (Optional)
+    TOKEN_SERVICE_LAMBDA_NAME: str = "revi-backend-cronjobs-all"  # Name or ARN of Lambda function that provides access tokens
+
     # Development Settings (Optional - only for dev environment)
     ENVIRONMENT: str = "prod"  
     DEV_AUTH_TOKEN: str = "" 

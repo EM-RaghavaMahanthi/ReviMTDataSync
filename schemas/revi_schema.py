@@ -347,6 +347,8 @@ class Customer(BaseModel):
     email: Optional[str] = None
     full_name: Optional[str] = None
     birth_date: Optional[datetime] = None
+    birth_day: Optional[int] = None
+    birth_month: Optional[int] = None
     phone_number: Optional[str] = None
     address_line1: Optional[str] = None
     address_line2: Optional[str] = None
@@ -1227,6 +1229,7 @@ class Order(BaseModel):
     customer_ref_id: Optional[int] = None
     account_id: Optional[int] = None
     customer_id: Optional[str] = None
+    parent_order: Optional[str] = None  # Parent order ID if this is a child order
     created_at: Optional[datetime] = None   # Let DB default
     created_by: Optional[int] = None
     updated_at: Optional[datetime] = None   # Let DB default
@@ -1257,6 +1260,7 @@ class OrderLines(BaseModel):
     title: Optional[str] = None
     processed_by: bool = False
     child_orders: List[str] = Field(default_factory=list)
+    is_valid: Optional[bool] = True  # Validation flag - set during ETL processing
     created_at: Optional[datetime] = None  
     created_by: Optional[int] = None
     updated_at: Optional[datetime] = None
@@ -1306,6 +1310,7 @@ class Reservation(BaseModel):
     membership_transactions_type: Optional[str] = None
     membership_transactions_id: Optional[int] = None
     membership_transactions_ref_id: Optional[int] = None
+    reservation_type_id: Optional[int] = None
     guest: bool = False
     customer_id: Optional[str] = None
     customer_ref_id: Optional[int] = None

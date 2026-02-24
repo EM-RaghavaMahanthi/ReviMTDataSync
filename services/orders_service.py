@@ -9,6 +9,10 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 
+from datetime import datetime, timezone
+
+
+
 def extract_payment_labels(payment_sources):
     """Aggregate payment source labels into comma-separated string."""
     if not payment_sources:
@@ -27,6 +31,7 @@ async def fetch_orders_page(location_id: str, page: int, account_id: str, api_ba
     from schemas.revi_schema import Order
     valid_orders = []
     data_list = resp.get("data", [])
+    crm_downloaded_at = datetime.now(timezone.utc)
     if not isinstance(data_list, list):
         logger.error(f"[API] Unexpected data format for location={location_id}, account_id={account_id}, page={page}: {data_list}")
         raise ValueError("API response 'data' is not a list")
@@ -46,8 +51,10 @@ async def fetch_orders_page(location_id: str, page: int, account_id: str, api_ba
         customer_id = extract_id_from_relationship("user")
         if not customer_id:
             logger.info(f"CUSTOMER_ID NOT FOUND order id={u.get('id')} for location={location_id}, account_id={account_id}, page={page}, customer_id={customer_id}")
-        else: 
-            logger.info(f"CUSTOMER_ID FOUND order id={u.get('id')} for location={location_id}, account_id={account_id}, page={page}, customer_id={customer_id}")
+    
+        # Extract parent_order from relationships
+        parent_order_id = extract_id_from_relationship("parent_order")
+        
         raw = {
             "order_id": u.get("id"),
             "date_placed": attributes.get("date_placed"),
@@ -58,8 +65,11 @@ async def fetch_orders_page(location_id: str, page: int, account_id: str, api_ba
             "order_lines_id": extract_id_from_relationship("order_lines"),
             "customer_ref_id": None,
             "customer_id": extract_id_from_relationship("user"),
+            "parent_order": parent_order_id,  # Add parent_order field
             "account_id": account_id,
+            "created_at": None,
             "created_by": None,
+            "updated_at": crm_downloaded_at,
             "updated_by": None,
             "deleted_at": None,
             "deleted_by": None

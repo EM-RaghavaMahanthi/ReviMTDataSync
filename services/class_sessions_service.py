@@ -7,6 +7,7 @@ from utils.s3_writer import write_parquet_to_s3
 from core.config import settings
 from pydantic import ValidationError
 import asyncio
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ async def fetch_class_sessions_page(location_id: str, page: int, account_id: str
     resp = await api_get("/class_sessions", api_base_url, params)
     logger.info(f"[API RESPONSE] Location {location_id} (account {account_id}) page {page}: Got {len(resp.get('data', []))} records from API")
     from schemas.revi_schema import ClassSessions  # Ensure correct import
+    crm_downloaded_at = datetime.now(timezone.utc)
 
     valid_class_sessions = []
     for u in resp.get("data", []):
@@ -35,7 +37,7 @@ async def fetch_class_sessions_page(location_id: str, page: int, account_id: str
             "cancellation_datetime": attributes.get("cancellation_datetime"),
             "created_at": None,          # Not needed if DB default
             "created_by": None,
-            "updated_at": None,          # Not needed if DB default
+            "updated_at": crm_downloaded_at,          # Not needed if DB default
             "updated_by": None,
             "deleted_at": None,
             "deleted_by": None,

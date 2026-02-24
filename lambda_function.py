@@ -667,9 +667,30 @@ async def async_lambda_handler(event, context):
             f"total_{entity_type}s": entity_count,
             "total_records": total_records,
             "total_expected": total_expected,
-            "missing_records": missing_records_count,
-            "results": results
+            "missing_records": missing_records_count
         }
+        # Build and send notifier response for each table
+        # Build and send single notifier response
+        teams_enabled = bool(getattr(settings, "teams_enabled", False))
+        print("teams_enabled", teams_enabled)
+        if teams_enabled:
+            try:
+                from adapter_src.onboard_notifier import CRMDataNotifier
+                emoji = "✅" if status == "success" else "❌"
+                nt_response = {
+                    "stage": "CRMtoS3(stage 1)",
+                    "table_name": resource,
+                    "account_id": account_id,
+                    "location_id": location_id,
+                    "status": f"{emoji} {status.upper()}",
+                    "total_records": total_records,
+                    "total_expected": total_expected,
+                    "missing_records": missing_records_count,
+                    "time_taken": f"{elapsed:.2f} seconds"
+                }
+                await CRMDataNotifier().notify(nt_response)
+            except Exception as notify_exc:
+                logger.error(f"[lambda_handler] CRMDataNotifier failed: {notify_exc}")
         logger.info(f"[lambda_handler] Finished processing for resource={resource}, account_id={account_id}")
         return {
             "status": status,
@@ -678,6 +699,22 @@ async def async_lambda_handler(event, context):
         }
     except Exception as exc:
         logger.critical(f"[lambda_handler] Lambda execution failed for account_id={account_id}: {exc}")
+        # Send single notifier response for error only if teams_enabled
+        teams_enabled = bool(getattr(settings, "teams_enabled", False))
+        print("teams_enabled", teams_enabled)
+        if teams_enabled:
+            try:
+                from adapter_src.onboard_notifier import CRMDataNotifier
+                nt_response = {
+                    "stage": "CRMtoS3(stage 1)",
+                    "table_name": resource,
+                    "account_id": account_id,
+                    "location_id": location_id,
+                    "status": "❌ ERROR"
+                }
+                await CRMDataNotifier().notify(nt_response)
+            except Exception as notify_exc:
+                logger.error(f"[lambda_handler] CRMDataNotifier failed in exception: {notify_exc}")
         return {
             "status": "error",
             "statusCode": 500,

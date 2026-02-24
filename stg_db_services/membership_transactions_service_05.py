@@ -273,13 +273,22 @@ async def step_4_count_transactions_with_missing_dependencies(account_id: str, l
             # Parse and log sample (already fetched from main query)
             if sample_problematic_records:
                 import json
-                sample_details = [
-                    (item['membership_transactions_id'], item['customer_id'], 
-                     item['membership_instances_id'], item['customer_status'], 
-                     item['instance_status'])
-                    for item in json.loads(sample_problematic_records)
-                ]
-                logger.warning(f"[STEP 4] Sample problematic records (tx_id, customer_id, instance_id, customer_status, instance_status): {sample_details}")
+                # Handle both cases: JSON string or already parsed list
+                if isinstance(sample_problematic_records, str):
+                    sample_data = json.loads(sample_problematic_records)
+                elif isinstance(sample_problematic_records, list):
+                    sample_data = sample_problematic_records
+                else:
+                    sample_data = []
+                
+                if sample_data:
+                    sample_details = [
+                        (item['membership_transactions_id'], item['customer_id'], 
+                         item['membership_instances_id'], item['customer_status'], 
+                         item['instance_status'])
+                        for item in sample_data
+                    ]
+                    logger.warning(f"[STEP 4] Sample problematic records (tx_id, customer_id, instance_id, customer_status, instance_status): {sample_details}")
         
         logger.info(f"[STEP 4] SUCCESS: Total invalid membership_transactions records: {total_invalid_transactions}")
         logger.info(f"[STEP 4] SUCCESS: Customer dependency issues: {missing_customer_transactions}")
@@ -310,34 +319,42 @@ async def step_5_calculate_expected_ready(account_id: str, location_id: int, tot
 async def step_6_count_records_to_insert(account_id: str, location_id: int, engine):
     """
     Step 6: Count records that are actually ready for insertion (validation before insert)
-    OPTIMIZED: Uses LEFT JOIN + IS NULL instead of NOT IN for better performance
+    OPTIMIZED: Multiple improvements for better performance
     """
     logger.info(f"[STEP 6] Counting records ready for insertion (validation)")
     
     try:
         with engine.begin() as conn:
-            # ✅ OPTIMIZED: LEFT JOIN instead of NOT IN
+            # ✅ OPTIMIZED: Using EXISTS instead of LEFT JOIN for better performance
+            # EXISTS short-circuits as soon as a match is found, while LEFT JOIN processes all records
             result = conn.execute(text("""
                 SELECT COUNT(*) as count
                 FROM mt_membership_transactions_details_dlk mt
-                INNER JOIN customers c 
-                    ON c.customer_id = mt.customer_id  
-                    AND c.account_id = :account_id
-                    AND c.location_id = :location_id
-                INNER JOIN membership_instances mi 
-                    ON mi.membership_instances_id = mt.membership_instances_id 
-                    AND mi.location = mt.location 
-                    AND mi.account_id = mt.account_id
-                    AND mi.account_id = :account_id
-                    AND mi.location = :location_id
-                LEFT JOIN public.membership_transactions mtr
-                    ON mtr.membership_transactions_id = mt.membership_transactions_id
-                    AND mtr.account_id = mt.account_id
-                    AND mtr.location = mt.location
                 WHERE mt.account_id = :account_id
                   AND mt.location = :location_id
                   AND mt.isin_reservation = true
-                  AND mtr.membership_transactions_id IS NULL
+                  AND EXISTS (
+                      SELECT 1 
+                      FROM customers c 
+                      WHERE c.customer_id = mt.customer_id  
+                        AND c.account_id = :account_id
+                        AND c.location_id = :location_id
+                  )
+                  AND EXISTS (
+                      SELECT 1 
+                      FROM membership_instances mi 
+                      WHERE mi.membership_instances_id = mt.membership_instances_id 
+                        AND mi.location = mt.location 
+                        AND mi.account_id = :account_id
+                        AND mi.location = :location_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 
+                      FROM public.membership_transactions mtr
+                      WHERE mtr.membership_transactions_id = mt.membership_transactions_id
+                        AND mtr.account_id = :account_id
+                        AND mtr.location = :location_id
+                  )
             """), {"account_id": account_id, "location_id": location_id})
             insert_ready_count = result.fetchone()[0]
             

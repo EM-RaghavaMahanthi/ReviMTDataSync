@@ -10,6 +10,8 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 
+from datetime import datetime, timezone
+
 async def fetch_reservations_page(entity_id: str, page: int, entity_type: str, account_id: str, api_base_url: str):
     """
     Fetches one page of reservations for a given entity (location/account).
@@ -23,6 +25,8 @@ async def fetch_reservations_page(entity_id: str, page: int, entity_type: str, a
     resp = await api_get("/reservations", api_base_url, params)
     from schemas.revi_schema import Reservation  # adjust import as needed
     valid_reservations = []
+
+    crm_downloaded_at = datetime.now(timezone.utc)
 
     for u in resp.get("data", []):
         attributes = u.get("attributes", {})
@@ -50,10 +54,13 @@ async def fetch_reservations_page(entity_id: str, page: int, entity_type: str, a
             "credit_transactions_type": None,
             "membership_transactions_ref_id": None,
             "membership_transactions_type": None,
+            "transaction_type": None,
             "customer_ref_id": None,
             "class_session_ref_id": None,
             "credit_transactions_id": None,
             "membership_transactions_id": None,
+            "created_at": None,
+            "updated_at": crm_downloaded_at,
             "created_by": None,
             "updated_by": None,
             "deleted_at": None,
@@ -67,6 +74,7 @@ async def fetch_reservations_page(entity_id: str, page: int, entity_type: str, a
         raw["membership_transactions_id"], raw["membership_transactions_type"] = get_ref_and_type("membership_transactions")
         raw["customer_id"] = relationships.get("user", {}).get("data", {}).get("id")
         raw["class_session_id"] = relationships.get("class_session", {}).get("data", {}).get("id")
+        raw["transaction_type"] = raw["credit_transactions_type"] if raw["credit_transactions_type"] else raw["membership_transactions_type"]
 
         try:
             reservation = Reservation(**raw)
@@ -200,7 +208,8 @@ async def process_reservations_for_entity(entity_id: str, account_id: str, api_b
 
     # Use concurrency limit from settings if not provided
     if concurrency_limit is None:
-        concurrency_limit = settings.CONCURRENCY_LIMIT
+        concurrency_limit = min(settings.CONCURRENCY_LIMIT, 128)
+        concurrency_limit = 64
     semaphore = asyncio.Semaphore(concurrency_limit)
 
     async def fetch_and_process(page):

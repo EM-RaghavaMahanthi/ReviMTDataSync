@@ -4,6 +4,7 @@ from utils.api_client import api_get
 from utils.s3_writer import write_parquet_to_s3
 from core.config import settings
 import asyncio
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ async def fetch_credit_transactions_page(user_id: str, page: int, account_id: st
     resp = await api_get("/credit_transactions", api_base_url, params)
     from schemas.revi_schema import CreditTransactionOrder
     valid_transactions = []
+    crm_downloaded_at = datetime.now(timezone.utc)
 
     def extract_id(rel):
         if not rel:
@@ -62,7 +64,7 @@ async def fetch_credit_transactions_page(user_id: str, page: int, account_id: st
             "location": location_id,                        # Can map from context or a relationship if present
             "created_at": None,                      # DB default
             "created_by": None,
-            "updated_at": None,                      # DB default
+            "updated_at": crm_downloaded_at,                      # DB default
             "updated_by": None,
             "deleted_at": None,
             "deleted_by": None,
@@ -158,4 +160,3 @@ async def process_credit_transactions_for_user(user_id: str, account_id: str, lo
     if total_processed != total_records:
         logger.warning(f"[MISSING] User {user_id}, Account {account_id}: Expected {total_records}, but only {total_processed} credit transactions written to S3. Missing: {total_records - total_processed}")
     return total_processed, total_records
-

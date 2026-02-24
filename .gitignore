@@ -21,7 +21,7 @@
 
 
 !core/**
-!data/**
+#!data/**
 !db/**
 !models/**
 !schemas/**
@@ -37,3 +37,5 @@
 **/*.pyo
 **/*.pyd
 .Python
+# Snyk Security Extension - AI Rules (auto-generated)
+.github/instructions/snyk_rules.instructions.md

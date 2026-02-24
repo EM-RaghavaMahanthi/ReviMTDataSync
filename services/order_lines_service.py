@@ -9,6 +9,10 @@ from utils.s3_writer import write_parquet_to_s3
 from core.config import settings
 import asyncio
 
+from datetime import datetime, timezone
+
+
+
 logger = logging.getLogger(__name__)
 
 def parse_single_transaction(transaction_data):
@@ -52,7 +56,7 @@ async def fetch_order_lines_page(location_id: str, page: int, account_id: str, a
             processed_by = False
 
         transaction_type, credit_transactions_id, membership_transactions_id = parse_single_transaction(attributes.get("transaction_data"))
-
+        crm_downloaded_at = datetime.now(timezone.utc)
         # Extract child_orders list - collect all order IDs where type is "orders"
         child_orders_data = relationships.get("child_orders", {}).get("data", [])
         child_orders = []
@@ -68,7 +72,7 @@ async def fetch_order_lines_page(location_id: str, page: int, account_id: str, a
             "title": attributes.get("title"),
             "created_at": None,
             "created_by": None,
-            "updated_at": None,
+            "updated_at": crm_downloaded_at,
             "updated_by": None,
             "deleted_at": None,
             "deleted_by": None,
@@ -79,7 +83,8 @@ async def fetch_order_lines_page(location_id: str, page: int, account_id: str, a
             "order_ref_id": None,
             "credit_transactions_ref_id": None,
             "membership_transactions_ref_id": None,
-            "child_orders": child_orders
+            "child_orders": child_orders,
+            "is_valid": True  # Default to True, will be updated during validation
         }
 
         try:

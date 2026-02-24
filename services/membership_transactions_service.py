@@ -4,6 +4,9 @@ from utils.s3_writer import write_parquet_to_s3
 from core.config import settings
 import asyncio
 
+from datetime import datetime, timezone
+
+
 logger = logging.getLogger(__name__)
 
 from pydantic import ValidationError
@@ -17,6 +20,7 @@ async def fetch_membership_transactions_page(user_id: str, page: int, account_id
     logger.info(f"[FETCH] Fetching page {page} for user {user_id} (account_id={account_id}, location_id={location_id}) with page_size={page_size}")
     resp = await api_get("/membership_transactions", api_base_url, params)
     from schemas.revi_schema import MembershipTransaction
+    crm_downloaded_at = datetime.now(timezone.utc)
 
     def extract_id(rel):
         if not rel:
@@ -45,7 +49,7 @@ async def fetch_membership_transactions_page(user_id: str, page: int, account_id
             "payment_interval_end_date": attributes.get("payment_interval_end_date"),
             "created_at": None,
             "created_by": None,
-            "updated_at": None,
+            "updated_at": crm_downloaded_at,
             "updated_by": None,
             "deleted_at": None,
             "deleted_by": None,
@@ -139,4 +143,3 @@ async def process_membership_transactions_for_user(user_id: str, account_id: str
     if total_processed != total_records:
         logger.warning(f"[MISSING] User {user_id} (account_id={account_id}, location_id={location_id}): Expected {total_records}, but only {total_processed} membership transactions written to S3. Missing: {total_records - total_processed}")
     return total_processed, total_records
-

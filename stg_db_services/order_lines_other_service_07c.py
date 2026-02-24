@@ -81,6 +81,7 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
                 WHERE account_id = :account_id
                   AND location = :location_id
                   AND transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                  AND is_valid = TRUE
             """), {"account_id": account_id, "location_id": str(location_id)})
             total_count = result.fetchone()[0]
         
@@ -111,6 +112,7 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                  AND stg.is_valid = TRUE
             """), {"account_id": account_id, "location_id": str(location_id)})
             existing_count = result.fetchone()[0]
         
@@ -139,6 +141,7 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, loca
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                  AND stg.is_valid = TRUE
             """), {"account_id": account_id, "location_id": str(location_id)})
             already_exist_count = result.fetchone()[0]
         
@@ -170,6 +173,7 @@ async def step_4_count_order_lines_with_missing_dependencies(account_id: str, lo
                     WHERE stg.account_id = :account_id
                       AND stg.location = :location_id
                       AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                      AND stg.is_valid = TRUE
                       AND o.order_id IS NULL  -- Order not found
                     GROUP BY stg.order_id
                 )
@@ -228,28 +232,32 @@ async def step_5_calculate_expected_ready(account_id: str, location_id: int, tot
 async def step_6_count_records_to_insert(account_id: str, location_id: int, engine):
     """
     Step 6: Count Other transaction order_lines records that are actually ready for insertion (validation before insert)
-    OPTIMIZED: Uses LEFT JOIN + IS NULL instead of NOT IN for better performance
+    OPTIMIZED: Uses EXCEPT for set difference - fastest approach without indexes
     """
     logger.info(f"[STEP 6] Counting Other transaction order_lines records ready for insertion (validation)")
     
     try:
         with engine.begin() as conn:
-            # ✅ OPTIMIZED: LEFT JOIN instead of NOT IN
             result = conn.execute(text("""
-                SELECT COUNT(*) as count
-                FROM mt_order_lines_details_dlk stg
-                INNER JOIN orders o
-                    ON o.order_id = stg.order_id
-                    AND o.account_id = :account_id
-                LEFT JOIN order_lines ol 
-                    ON ol.order_line_id = stg.order_line_id
-                    AND ol.account_id = stg.account_id
-                    AND ol.location = stg.location
-                    AND ol.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                WHERE stg.account_id = :account_id
-                  AND stg.location = :location_id
-                  AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
-                  AND ol.order_line_id IS NULL
+                SELECT COUNT(*) FROM (
+                    SELECT stg.order_line_id
+                    FROM mt_order_lines_details_dlk stg
+                    INNER JOIN orders o 
+                        ON o.order_id = stg.order_id 
+                        AND o.account_id = :account_id
+                    WHERE stg.account_id = :account_id
+                      AND stg.location = :location_id
+                      AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                      AND stg.is_valid = TRUE
+                    
+                    EXCEPT
+                    
+                    SELECT ol.order_line_id
+                    FROM order_lines ol
+                    WHERE ol.account_id = :account_id
+                      AND ol.location = :location_id
+                      AND ol.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                ) AS missing_records
             """), {"account_id": account_id, "location_id": str(location_id)})
             insert_ready_count = result.fetchone()[0]
             
@@ -285,6 +293,7 @@ async def step_7_insert_new_records(account_id: str, location_id: int, engine):
                 WHERE stg.account_id = :account_id
                   AND stg.location = :location_id
                   AND stg.transaction_type NOT IN ('CreditTransaction', 'MembershipTransaction')
+                  AND stg.is_valid = TRUE
                   AND stg.order_line_id NOT IN (
                     SELECT order_line_id FROM order_lines 
                     WHERE account_id = :account_id 

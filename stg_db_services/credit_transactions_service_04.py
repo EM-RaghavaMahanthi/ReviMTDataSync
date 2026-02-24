@@ -367,15 +367,15 @@ async def process_credit_transactions(account_id: str, location_id: int, engine)
         logger.info(f"[process_credit_transactions] Validation passed - proceeding with insertion")
         
         # Step 7: Insert new records (optimize for zero records)
-        # if ready_to_insert == 0:
-        #     logger.info(f"[process_credit_transactions] No records to insert - skipping insertion step")
-        #     actual_inserted = 0
-        # else:
-        #     try:
-        #         actual_inserted = await step_6_insert_new_records(account_id, location_id, engine)
-        #     except Exception as e:
-        #         logger.error(f"[process_credit_transactions] ERROR: Step 7 failed: {e}")
-        #         raise
+        if ready_to_insert == 0:
+            logger.info(f"[process_credit_transactions] No records to insert - skipping insertion step")
+            actual_inserted = 0
+        else:
+            try:
+                actual_inserted = await step_6_insert_new_records(account_id, location_id, engine)
+            except Exception as e:
+                logger.error(f"[process_credit_transactions] ERROR: Step 7 failed: {e}")
+                raise
         
         # Summary logging
         logger.info(f"[process_credit_transactions] SUMMARY for account_id={account_id}, location_id={location_id}:")

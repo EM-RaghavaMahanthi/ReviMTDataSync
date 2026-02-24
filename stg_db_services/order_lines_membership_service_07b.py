@@ -28,6 +28,7 @@ async def step_0_drop_duplicates_in_staging(account_id: str, location_id: int, e
                 WHERE account_id = :account_id
                   AND location = :location_id
                   AND transaction_type = 'MembershipTransaction'
+                  AND is_valid = TRUE
             """), {"account_id": account_id, "location_id": str(location_id)})
             stats = count_result.fetchone()
             total_before = stats[0]
@@ -89,6 +90,7 @@ async def step_1_count_total_records(account_id: str, location_id: int, engine):
                   WHERE stg.account_id = :account_id
                     AND stg.location = :location_id
                     AND stg.transaction_type = 'MembershipTransaction'
+                    AND stg.is_valid = TRUE
                   ORDER BY mto.id, stg.updated_at DESC
                 ) unique_records
             """), {"account_id": account_id, "location_id": str(location_id)})
@@ -125,6 +127,7 @@ async def step_2_count_existing_in_main_table(account_id: str, location_id: int,
                     WHERE stg.account_id = :account_id
                         AND stg.location = :location_id
                         AND stg.transaction_type = 'MembershipTransaction'
+                        AND stg.is_valid = TRUE
                     ORDER BY mto.id, stg.updated_at DESC
                 )
                 SELECT COUNT(*)
@@ -173,6 +176,7 @@ async def step_4_count_order_lines_with_missing_dependencies(account_id: str, lo
                     WHERE stg.account_id = :account_id
                         AND stg.location = :location_id
                         AND stg.transaction_type = 'MembershipTransaction'
+                        AND stg.is_valid = TRUE
                     ORDER BY mto.id, stg.updated_at DESC
                 )
                 SELECT 
@@ -239,6 +243,7 @@ async def step_6_count_records_to_insert(account_id: str, location_id: int, engi
                     WHERE stg.account_id = :account_id
                         AND stg.location = :location_id
                         AND stg.transaction_type = 'MembershipTransaction'
+                        AND stg.is_valid = TRUE
                     ORDER BY mto.id, stg.updated_at DESC
                 )
                 SELECT COUNT(*)
@@ -295,6 +300,7 @@ async def step_7_insert_records(account_id: str, location_id: int, engine):
                   WHERE stg.account_id = :account_id
                     AND stg.location = :location_id
                     AND stg.transaction_type = 'MembershipTransaction'
+                    AND stg.is_valid = TRUE
                   ORDER BY mto.id, stg.updated_at DESC
                 )
                 INSERT INTO public.order_lines (

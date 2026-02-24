@@ -22,22 +22,23 @@ from stg_db_services.reservations_service_08 import process_reservations
 
 logger = logging.getLogger("lambda_function_stg_db")
 
-async def post_processing_step(account_id: int, is_post_process=False):
-
-
+async def post_processing_step(account_id: int, is_post_process=False, token_service_lambda_name: str = None):
     """
     Post-processing step that calls an endpoint after all tables are successfully processed.
-    Uses Auth0 authentication and analytics API client.
+    Gets access token from a centralized Lambda function instead of calling Auth0 directly.
     Only called if all table processing succeeds.
     
     Args:
         account_id: The account ID to send to the post-processing endpoint
+        is_post_process: Flag to enable/disable post-processing
+        token_service_lambda_name: Name of the Lambda function that provides access tokens
+                                   (e.g., 'auth-token-service' or your Lambda ARN)
         
     Returns:
         bool: True if post-processing succeeded, False otherwise
     """
 
-    if(not is_post_process):
+    if not is_post_process:
         logger.info(f"🚀 Skipping post-processing step for account_id={account_id}")
         return True  # Skip post-processing if flag not set
 
@@ -45,21 +46,36 @@ async def post_processing_step(account_id: int, is_post_process=False):
     
     try:
         # Import the clients
-        from clients.auth_client import Auth0Client
         from clients.api_client import AnalyticsAPIClient
+        from clients.lambda_auth_client import get_lambda_invoker
+        from core.stg_db_config import settings
         
-        # Get authentication token
-        logger.info("🔐 Getting authentication token...")
-        async with Auth0Client() as auth_client:
-            access_token = await auth_client.get_access_token()
+        # Get Lambda function name from settings or parameter
+        if token_service_lambda_name is None:
+            token_service_lambda_name = getattr(settings, 'TOKEN_SERVICE_LAMBDA_NAME', None)
+        
+        if not token_service_lambda_name:
+            logger.error("❌ Token service Lambda name not provided")
+            logger.info("� Falling back to direct Auth0 call...")
+            
+            # Fallback to direct Auth0 call
+            from clients.auth_client import Auth0Client
+            async with Auth0Client() as auth_client:
+                access_token = await auth_client.get_access_token()
+        else:
+            # Get authentication token from Lambda function
+            logger.info(f"🔐 Getting authentication token from Lambda: {token_service_lambda_name}")
+            lambda_invoker = get_lambda_invoker()
+            access_token = await lambda_invoker.get_access_token_from_lambda(token_service_lambda_name)
+            
+            if not access_token:
+                logger.error("❌ Failed to get access token from Lambda")
+                return False
         
         # Call post-processing endpoint
         logger.info("📤 Calling post-processing endpoint...")
         async with AnalyticsAPIClient() as api_client:
-            # TODO: Replace 'post-process' with your actual endpoint path
-            endpoint = f"eztexting/sync-with-eztexting"  
-
-            response_data = None
+            endpoint = f"eztexting/sync-with-eztexting"
 
             response_data = await api_client.post_endpoint(
                 endpoint=endpoint,
@@ -71,7 +87,7 @@ async def post_processing_step(account_id: int, is_post_process=False):
             return True
                     
     except Exception as e:
-        logger.error(f"💥 Post-processing failed: {e}")
+        logger.error(f"💥 Post-processing failed: {e}", exc_info=True)
         return False
 
 # Define the processing order and service functions
@@ -203,7 +219,7 @@ async def async_stg_to_db_handler(event, context=None):
         else:
             # All tables succeeded - proceed with post-processing
             logger.info("🎯 All tables processed successfully, starting post-processing step")
-            post_process_successful = await post_processing_step(account_id, False)
+            post_process_successful = await post_processing_step(account_id, True)
 
             if post_process_successful:
                 overall_status = "success"

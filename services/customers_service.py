@@ -7,6 +7,7 @@ from utils.api_client import api_get
 from utils.s3_writer import write_parquet_to_s3
 from core.config import settings  
 import asyncio
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,22 @@ async def fetch_customers_page(location_id: str, page: int, account_id: str, api
         
         # Extract home_location_id from relationships if available
         home_location_data = relationships.get("home_location", {}).get("data")
+        crm_downloaded_at = datetime.now(timezone.utc)
         home_location_id = home_location_data.get("id") if home_location_data else None
+        
+        # Extract birth_day and birth_month from birth_date if available
+        birth_date = attributes.get("birth_date")
+        birth_day = None
+        birth_month = None
+        if birth_date:
+            try:
+                # Parse birth_date (assuming ISO format or similar)
+                if isinstance(birth_date, str):
+                    dt = datetime.fromisoformat(birth_date.replace('Z', '+00:00'))
+                    birth_day = dt.day
+                    birth_month = dt.month
+            except Exception as e:
+                logger.warning(f"[BIRTH_DATE] Location {location_id}, Customer {u.get('id')}: Failed to parse birth_date '{birth_date}': {e}")
         
         raw = {
             "customer_id": str(u.get("id")),
@@ -36,7 +52,9 @@ async def fetch_customers_page(location_id: str, page: int, account_id: str, api
             "last_name": attributes.get("last_name"),
             "email": attributes.get("email"),
             "full_name": attributes.get("full_name"),
-            "birth_date": attributes.get("birth_date"),
+            "birth_date": birth_date,
+            "birth_day": birth_day,
+            "birth_month": birth_month,
             "phone_number": attributes.get("phone_number"),
             "address_line1": attributes.get("address_line1"),
             "address_line2": attributes.get("address_line2"),
@@ -53,7 +71,7 @@ async def fetch_customers_page(location_id: str, page: int, account_id: str, api
             "state_id": None,  
             "created_at": None,          # Not needed if DB default
             "created_by": None,
-            "updated_at": None,          # Not needed if DB default
+            "updated_at": crm_downloaded_at,          # Not needed if DB default
             "updated_by": None,
             "deleted_at": None,
             "deleted_by": None,

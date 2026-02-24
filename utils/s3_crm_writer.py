@@ -58,11 +58,13 @@ async def write_parquet_to_s3_crm(
     # Create S3 key with CRM structure: prefix/domain/table_name/filename
     if s3_prefix:
         # Even with custom prefix, maintain domain/table_name structure
-        key = f"{s3_prefix}/{domain}/{table_name}/{filename}"
+        #key = f"{s3_prefix}/{domain}/{table_name}/{filename}"
+        key = f"{s3_prefix}/{table_name}/{domain}/{filename}"
     else:
         # Use default CRM prefix structure with domain folder
         default_prefix = getattr(settings, "S3_CRM_PREFIX", "raw-data")
-        key = f"{default_prefix}/{domain}/{table_name}/{filename}"
+        key = f"{default_prefix}/{table_name}/{domain}/{filename}"
+        #key = f"{default_prefix}/{domain}/{table_name}/{filename}"
 
    
 
