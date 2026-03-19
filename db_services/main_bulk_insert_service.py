@@ -52,6 +52,35 @@ DATETIME_COLUMNS = {
     'creation_date'
 }
 
+# Define VARCHAR column max lengths to prevent "value too long" errors
+VARCHAR_LIMITS = {
+    'first_name': 64,
+    'last_name': 64,
+    'email': 128,
+    'full_name': 128,
+    'phone_number': 32,
+    'address_line1': 128,
+    'address_line2': 128,
+    'address_line3': 128,
+    'city': 64,
+    'country': 64,
+    'state_province': 64,
+    'customer_state': 64,
+    'postal_code': 32,
+    'gender': 16,
+    'status': 64,
+    'credit_name': 128,
+    'membership_name': 128,
+    'title': 256,
+    'processed_by': 64,
+    'reservation_type': 64,
+    'transaction_type': 64,
+    'credit_transactions_type': 64,
+    'membership_transactions_type': 64,
+    'parent_credit_transaction_type': 64,
+    'payment_sources_labels': 256,
+}
+
 TABLE_S3_CONFIG = {
     "customers": {
         "s3_prefix": settings.CUSTOMERS_S3_PREFIX,
@@ -157,6 +186,14 @@ def bulk_insert(table_name: str, rows: List[Dict], engine, columns=None):
                         # Convert 2-digit year to 4-digit (assume 1900s for years 00-99)
                         full_year = 1900 + year if year >= 0 else year
                         val = f"{full_year}-{parts[1]}-{parts[2]}"
+            
+            # Truncate VARCHAR columns to max length to prevent "value too long" errors
+            if col_name in VARCHAR_LIMITS:
+                max_len = VARCHAR_LIMITS[col_name]
+                if len(val) > max_len:
+                    val = val[:max_len]
+                    logger.warning(f"Truncated {col_name} from {len(val)} to {max_len} chars")
+            
             # Escape commas, quotes, and newlines for CSV
             val = str(val).replace('"', '""')  # Escape quotes
             if ',' in val or '"' in val or '\n' in val or '\r' in val:
@@ -658,7 +695,7 @@ def etl_all_tables(bucket: str, account_id: str, engine, check_stale: bool = Fal
     stale_results = None
     if check_stale:
         logger.info("🔍 check_stale=True, starting stale data update process...")
-        stale_results = update_stale_data(engine, account_id, update=False)
+        stale_results = update_stale_data(engine, account_id, update=True)
         stale_update_success = stale_results.get('success', False)
         if stale_update_success:
             logger.info("✅ Stale data update completed successfully")

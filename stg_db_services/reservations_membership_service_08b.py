@@ -256,7 +256,7 @@ async def step_5_insert_new_records(account_id: str, location_id: str, engine):
                   stg.location, now() AS created_at, 1 AS created_by, now() AS updated_at, stg.updated_by, stg.deleted_at, stg.deleted_by,
                   stg.first_timer, stg.class_session_id, stg.reservation_type, stg.account_id, cs.id AS class_session_ref_id,
                   NULL AS credit_transactions_ref_id, c.id AS customer_ref_id, mt.id AS membership_transactions_ref_id, 
-                  stg.reservation_type as prev_reservation_type, stg.transactions_type
+                  stg.reservation_type as prev_reservation_type, stg.transaction_type
                 FROM mt_reservations_details_dlk stg
                 INNER JOIN customers c
                   ON c.customer_id = stg.customer_id
