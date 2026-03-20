@@ -17,11 +17,18 @@ class Settings(BaseSettings):
     READ_TIMEOUT: int = 120  # 2 minutes
     
     # Lambda Settings (Optional)
-    TOKEN_SERVICE_LAMBDA_NAME: str = "revi-backend-cronjobs-all"  # Name or ARN of Lambda function that provides access tokens
+    TOKEN_SERVICE_LAMBDA_NAME: str = "revi-backend-cronjobs-all"
+    IS_POST_PROCESS: bool = True
+
+    # MS Teams Notifications
+    TEAMS_ENABLED: bool = False
+    TEAMS_WEBHOOK_URL: str = ""
+    TEAMS_MAX_RETRIES: int = 5
+    TEAMS_TIMEOUT_SECONDS: int = 30
 
     # Development Settings (Optional - only for dev environment)
-    ENVIRONMENT: str = "prod"  
-    DEV_AUTH_TOKEN: str = "" 
+    ENVIRONMENT: str = "prod"
+    DEV_AUTH_TOKEN: str = ""
 
     class Config:
         env_file = ".env"

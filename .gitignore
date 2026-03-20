@@ -1,41 +1,39 @@
-# Ignore everything
+# Ignore everything by default — only allowlisted paths are tracked.
 *
 
-# Except these directories
+# ── Source directories ────────────────────────────────────────────────────────
 !core/
-!data/
-!db/
-!models/
-!schemas/
-!services/
+!clients/
+!handlers/
+!notifiers/
+!crm_sync/
 !db_services/
-!utils/
 !stg_db_services/
-
-# Except these files
-!lambda_function*.py
-!uv_requirements.txt
-
-# Don't ignore .gitignore itself
-!.gitignore
-
+!schemas/
+!utils/
+!sql_cmds/
+!deployments/
 
 !core/**
-#!data/**
-!db/**
-!models/**
-!schemas/**
-!services/**
+!clients/**
+!handlers/**
+!notifiers/**
+!crm_sync/**
 !db_services/**
-!utils/**
 !stg_db_services/**
+!schemas/**
+!utils/**
+!sql_cmds/**
+!deployments/**
 
+# ── Root files ────────────────────────────────────────────────────────────────
+!.gitignore
+!uv_requirements.txt
+!README.md
 
-
+# ── Always exclude ────────────────────────────────────────────────────────────
 **/__pycache__/
 **/*.py[cod]
 **/*.pyo
 **/*.pyd
 .Python
-# Snyk Security Extension - AI Rules (auto-generated)
-.github/instructions/snyk_rules.instructions.md

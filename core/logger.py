@@ -20,3 +20,8 @@ def setup_logging(log_level: str = "INFO") -> None:
 
     # Prevent propagation if needed
     logger.propagate = False
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a named logger. Call setup_logging() first."""
+    return logging.getLogger(name)
