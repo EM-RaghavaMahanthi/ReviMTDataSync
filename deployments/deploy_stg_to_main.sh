@@ -1,6 +1,5 @@
 #!/bin/bash
-# Deploy stg_to_main Lambda — packages source and uploads to AWS.
-# Env vars, layers, handler are managed manually in the AWS Console.
+# Deploy stg_to_main Lambda — packages source, uploads to AWS, and sets handler.
 #   Handler: handlers.stg_to_db.lambda_handler
 #
 # Usage (run from repo root):
@@ -9,7 +8,7 @@
 
 set -euo pipefail
 
-LAMBDA_NAME="${LAMBDA_NAME:-revi-data-sync-stg-to-db-dev}"
+LAMBDA_NAME="${LAMBDA_NAME:-revi-data-sync-stg-to-db}"
 AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
 ZIP_NAME="stg_to_main_deploy.zip"
 BUILD_DIR="stg_to_main_build"
@@ -46,7 +45,17 @@ aws lambda update-function-code \
     --function-name "$LAMBDA_NAME" \
     --zip-file "fileb://$ZIP_NAME" \
     --output text --query 'FunctionName' \
-    && success "Done — $LAMBDA_NAME updated." \
     || error "Deploy failed."
+
+info "Waiting for update to complete..."
+aws lambda wait function-updated --function-name "$LAMBDA_NAME"
+
+info "Setting handler..."
+aws lambda update-function-configuration \
+    --function-name "$LAMBDA_NAME" \
+    --handler "handlers.stg_to_db.lambda_handler" \
+    --output text --query 'FunctionName' \
+    && success "Done — $LAMBDA_NAME updated." \
+    || error "Failed to set handler."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"

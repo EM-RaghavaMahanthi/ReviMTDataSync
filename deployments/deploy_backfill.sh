@@ -1,18 +1,17 @@
 #!/bin/bash
-# Deploy s3_to_db Lambda — packages source, uploads to AWS, and sets handler.
-#   Handler: handlers.s3_to_db.lambda_handler
+# Deploy backfill_order_lines Lambda — packages source, uploads to AWS, and sets handler.
+#   Handler: handlers.backfill_order_lines.lambda_handler
 #
 # Usage (run from repo root):
-#   ./deployments/deploy_s3_to_db.sh
-#   LAMBDA_NAME=other-function ./deployments/deploy_s3_to_db.sh
+#   ./deployments/deploy_backfill.sh
+#   LAMBDA_NAME=other-function ./deployments/deploy_backfill.sh
 
 set -euo pipefail
 
-LAMBDA_NAME="${LAMBDA_NAME:-revi-crm-db-sync}"
-AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
-ZIP_NAME="s3_to_db_deploy.zip"
-BUILD_DIR="s3_to_db_build"
-SOURCE_DIRS=("core" "clients" "handlers" "db_services" "schemas" "utils" "sql_cmds")
+LAMBDA_NAME="${LAMBDA_NAME:-revi-syncdata-test-dev}"
+ZIP_NAME="backfill_deploy.zip"
+BUILD_DIR="backfill_build"
+SOURCE_DIRS=("core" "clients" "handlers" "crm_sync" "db_services" "schemas" "utils" "sql_cmds" "notifiers")
 
 info()    { echo "[INFO]  $*"; }
 success() { echo "[OK]    $*"; }
@@ -39,7 +38,7 @@ cd ..
 ZIP_SIZE=$(du -h "$ZIP_NAME" | cut -f1)
 info "Zip: $ZIP_NAME ($ZIP_SIZE)"
 
-export AWS_PROFILE="$AWS_PROFILE"
+export AWS_PROFILE="${AWS_PROFILE:-}"
 info "Deploying to $LAMBDA_NAME..."
 aws lambda update-function-code \
     --function-name "$LAMBDA_NAME" \
@@ -53,7 +52,7 @@ aws lambda wait function-updated --function-name "$LAMBDA_NAME"
 info "Setting handler..."
 aws lambda update-function-configuration \
     --function-name "$LAMBDA_NAME" \
-    --handler "handlers.s3_to_db.lambda_handler" \
+    --handler "handlers.backfill_order_lines.lambda_handler" \
     --output text --query 'FunctionName' \
     && success "Done — $LAMBDA_NAME updated." \
     || error "Failed to set handler."

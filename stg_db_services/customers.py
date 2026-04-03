@@ -215,7 +215,7 @@ async def process_customers(account_id: str, location_id: int, engine):
     try:
         # Step 0: Drop duplicates in staging table
         try:
-            step_0_result = drop_staging_duplicates(engine, "mt_customers_details_dlk", "customer_id", account_id, location_id)
+            step_0_result = drop_staging_duplicates(engine, "mt_customers_details_dlk", "customer_id", account_id)
             duplicates_found = step_0_result["duplicates_found"]
             duplicates_removed = step_0_result["duplicates_removed"]
         except Exception as e:

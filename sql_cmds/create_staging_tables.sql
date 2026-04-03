@@ -124,6 +124,7 @@ CREATE TABLE "mt_order_lines_details_dlk" (
   credit_transactions_id integer,
   membership_transactions_id integer,
   title character varying(255),
+  line_total double precision,
   processed_by boolean,
   child_orders text,
   is_valid boolean DEFAULT TRUE,

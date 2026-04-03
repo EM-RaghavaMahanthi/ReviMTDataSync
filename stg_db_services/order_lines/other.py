@@ -278,13 +278,13 @@ async def step_7_insert_new_records(account_id: str, location_id: int, engine):
             result = conn.execute(text("""
                 INSERT INTO public.order_lines (
                   order_line_id, order_id, transaction_type, location, credit_transactions_id, membership_transactions_id,
-                  title, processed_by, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by,
+                  title, line_total, processed_by, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by,
                   account_id, credit_transactions_ref_id, membership_transactions_ref_id, order_ref_id
                 )
-                SELECT 
+                SELECT
                   stg.order_line_id, stg.order_id, stg.transaction_type, stg.location, stg.credit_transactions_id, stg.membership_transactions_id,
-                  stg.title, stg.processed_by, now() AS created_at, 1 AS created_by, now() AS updated_at, stg.updated_by, 
-                  stg.deleted_at, stg.deleted_by, stg.account_id, NULL AS credit_transactions_ref_id, 
+                  stg.title, stg.line_total, stg.processed_by, now() AS created_at, 1 AS created_by, now() AS updated_at, stg.updated_by,
+                  stg.deleted_at, stg.deleted_by, stg.account_id, NULL AS credit_transactions_ref_id,
                   NULL AS membership_transactions_ref_id, o.id AS order_ref_id
                 FROM mt_order_lines_details_dlk stg
                 INNER JOIN orders o

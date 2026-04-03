@@ -70,7 +70,7 @@ TABLE_COLUMNS_MAP = {
     ],
     "order_lines": [
         "id", "order_line_id", "order_id", "transaction_type", "location",
-        "credit_transactions_id", "membership_transactions_id", "title",
+        "credit_transactions_id", "membership_transactions_id", "title", "line_total",
         "processed_by", "child_orders", "is_valid",
         "created_at", "created_by", "updated_at", "updated_by",
         "deleted_at", "deleted_by", "account_id",
@@ -345,6 +345,75 @@ def add_membership_transaction_flags(rows: List[Dict], ol_ids: set, res_ids: set
         if row["isin_reservation"]: res_matches += 1
     logger.info(f"[membership_transactions] {ol_matches} in order_lines, {res_matches} in reservations")
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Targeted order_lines staging (backfill use)
+# ---------------------------------------------------------------------------
+
+def stage_order_lines_only(bucket: str, account_id: str, engine) -> int:
+    """
+    Create mt_order_lines_details_dlk, fetch order_lines parquet from S3,
+    and bulk-insert into staging. Returns number of rows staged.
+    Used by the backfill lambda — does not touch any other staging table.
+    """
+    create_sql = """
+        DROP TABLE IF EXISTS "mt_order_lines_details_dlk";
+        CREATE TABLE "mt_order_lines_details_dlk" (
+          id integer,
+          order_line_id character varying(64),
+          order_id text,
+          transaction_type character varying(255),
+          location character varying(255),
+          credit_transactions_id integer,
+          membership_transactions_id integer,
+          title character varying(255),
+          line_total double precision,
+          processed_by boolean,
+          child_orders text,
+          is_valid boolean DEFAULT TRUE,
+          created_at timestamp(3) without time zone,
+          created_by integer,
+          updated_at timestamp(3) without time zone,
+          updated_by integer,
+          deleted_at timestamp(3) without time zone,
+          deleted_by integer,
+          account_id integer,
+          credit_transactions_ref_id integer,
+          membership_transactions_ref_id integer,
+          order_ref_id integer
+        );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(create_sql))
+    logger.info("[stage_order_lines_only] Staging table ready")
+
+    config = TABLE_S3_CONFIG["order_lines"]
+    prefix = f"{config['s3_prefix']}/account_id_{account_id}"
+    df = fetch_from_s3(bucket, prefix, account_id)
+    if df.empty:
+        logger.warning("[stage_order_lines_only] No parquet files found in S3")
+        return 0
+
+    df = df.where(pd.notnull(df), None)
+    cleaned_rows = [clean_row(row, TABLE_COLUMNS_MAP["order_lines"]) for row in df.to_dict(orient="records")]
+    bulk_insert("mt_order_lines_details_dlk", cleaned_rows, engine, columns=TABLE_COLUMNS_MAP["order_lines"])
+    logger.info(f"[stage_order_lines_only] Staged {len(cleaned_rows)} rows")
+    return len(cleaned_rows)
+
+
+def append_order_lines_to_staging(rows: list, engine) -> int:
+    """
+    Bulk-insert additional order_lines rows into the EXISTING staging table.
+    Does NOT drop/recreate — used after stage_order_lines_only() to add
+    the batch_missing records fetched by ID.
+    """
+    if not rows:
+        return 0
+    cleaned = [clean_row(r, TABLE_COLUMNS_MAP["order_lines"]) for r in rows]
+    bulk_insert("mt_order_lines_details_dlk", cleaned, engine, columns=TABLE_COLUMNS_MAP["order_lines"])
+    logger.info(f"[append_order_lines_to_staging] Appended {len(cleaned)} rows")
+    return len(cleaned)
 
 
 # ---------------------------------------------------------------------------

@@ -77,6 +77,7 @@ class OrderLines(BaseModel):
     membership_transactions_id: Optional[int] = None
     membership_transactions_ref_id: Optional[int] = None
     title: Optional[str] = None
+    line_total: Optional[float] = None
     processed_by: bool = False
     child_orders: List[str] = Field(default_factory=list)
     is_valid: Optional[bool] = True

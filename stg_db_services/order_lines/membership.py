@@ -279,6 +279,7 @@ async def step_7_insert_records(account_id: str, location_id: int, engine):
                     stg.credit_transactions_id,
                     stg.membership_transactions_id,
                     stg.title,
+                    stg.line_total,
                     stg.processed_by,
                     now() AS created_at,
                     1 AS created_by,
@@ -305,12 +306,12 @@ async def step_7_insert_records(account_id: str, location_id: int, engine):
                 )
                 INSERT INTO public.order_lines (
                   order_line_id, order_id, transaction_type, location, credit_transactions_id, membership_transactions_id,
-                  title, processed_by, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by,
+                  title, line_total, processed_by, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by,
                   account_id, credit_transactions_ref_id, membership_transactions_ref_id, order_ref_id
                 )
-                SELECT 
+                SELECT
                   order_line_id, order_id, transaction_type, location, credit_transactions_id, membership_transactions_id,
-                  title, processed_by, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by,
+                  title, line_total, processed_by, created_at, created_by, updated_at, updated_by, deleted_at, deleted_by,
                   account_id, NULL AS credit_transactions_ref_id, membership_transactions_ref_id, order_ref_id
                 FROM candidate_rows cr
                 WHERE NOT EXISTS (

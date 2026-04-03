@@ -1,6 +1,6 @@
 #!/bin/bash
-# Deploy crm_to_s3 Lambda — packages source and uploads to AWS.
-# Env vars, layers, handler are managed manually in the AWS Console.
+# Deploy crm_to_s3 Lambda — packages source, uploads to AWS, and sets handler.
+#   Handler: handlers.crm_to_s3.lambda_handler
 #
 # Usage (run from repo root):
 #   ./deployments/deploy_crm_to_s3.sh
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-LAMBDA_NAME="${LAMBDA_NAME:-revi-syncdata-test-dev}"
+LAMBDA_NAME="${LAMBDA_NAME:-revi-syncdata-test}"
 AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
 ZIP_NAME="crm_to_s3_deploy.zip"
 BUILD_DIR="crm_to_s3_build"
@@ -45,7 +45,17 @@ aws lambda update-function-code \
     --function-name "$LAMBDA_NAME" \
     --zip-file "fileb://$ZIP_NAME" \
     --output text --query 'FunctionName' \
-    && success "Done — $LAMBDA_NAME updated." \
     || error "Deploy failed."
+
+info "Waiting for update to complete..."
+aws lambda wait function-updated --function-name "$LAMBDA_NAME"
+
+info "Setting handler..."
+aws lambda update-function-configuration \
+    --function-name "$LAMBDA_NAME" \
+    --handler "handlers.crm_to_s3.lambda_handler" \
+    --output text --query 'FunctionName' \
+    && success "Done — $LAMBDA_NAME updated." \
+    || error "Failed to set handler."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"
