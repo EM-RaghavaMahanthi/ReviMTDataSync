@@ -3,7 +3,7 @@ import asyncio
 import time
 import logging
 from core.stg_db_config import settings
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from core.logger import setup_logging
 setup_logging()
@@ -40,6 +40,20 @@ async def _notify_stage3(account_id, status: str, success_count: int, total_tabl
         })
     except Exception as e:
         logger.error(f"Stage3Notifier failed: {e}")
+
+VACUUM_TABLES = [
+    "customers", "orders", "order_lines", "reservations",
+    "class_sessions", "credit_transactions", "credit_transactions_orders",
+    "membership_transactions", "membership_transactions_orders", "membership_instances",
+]
+
+
+def _vacuum_tables(engine):
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        for table in VACUUM_TABLES:
+            conn.execute(text(f"VACUUM ANALYZE {table}"))
+            logger.info(f"[vacuum] VACUUM ANALYZE {table} done")
+
 
 PROCESSING_ORDER = [
     ("customers_01",                    process_customers),
@@ -111,6 +125,8 @@ async def async_stg_to_db_handler(event, context=None):
 
     try:
         logger.info(f"stg_to_db starting — account_id={account_id}, location_id={location_id}")
+
+        _vacuum_tables(engine)
 
         successful_tables = []
         failed_tables = []
