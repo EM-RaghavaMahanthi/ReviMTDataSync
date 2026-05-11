@@ -41,6 +41,117 @@ async def _notify_stage3(account_id, status: str, success_count: int, total_tabl
     except Exception as e:
         logger.error(f"Stage3Notifier failed: {e}")
 
+def _update_customer_class_dates(engine, account_id, update: bool = False) -> dict:
+    """
+    Count customers whose last_class_date or next_class_date differs from computed values.
+    If update=True, runs the UPDATE and validates rowcount matches expected.
+    """
+    count_sql = text("""
+        WITH last_class AS (
+            SELECT
+                r.customer_ref_id,
+                MAX(r.check_in_date) AS last_class_date
+            FROM reservations r
+            WHERE r.account_id    = :account_id
+              AND r.status        = 'check in'
+              AND r.deleted_at    IS NULL
+              AND r.check_in_date IS NOT NULL
+            GROUP BY r.customer_ref_id
+        ),
+        next_class AS (
+            SELECT DISTINCT ON (r.customer_ref_id)
+                r.customer_ref_id,
+                cs.start_datetime AS next_class_date
+            FROM reservations r
+            INNER JOIN class_sessions cs
+                ON cs.id          = r.class_session_ref_id
+               AND cs.deleted_at  IS NULL
+            WHERE r.account_id = :account_id
+              AND r.status     = 'pending'
+              AND r.deleted_at IS NULL
+              AND cs.start_datetime > NOW()
+            ORDER BY r.customer_ref_id, cs.start_datetime ASC
+        )
+        SELECT COUNT(*) FROM customers c
+        LEFT JOIN last_class lc ON lc.customer_ref_id = c.id
+        LEFT JOIN next_class nc ON nc.customer_ref_id = c.id
+        WHERE c.account_id = :account_id
+          AND (
+            c.last_class_date IS DISTINCT FROM lc.last_class_date
+            OR
+            c.next_class_date IS DISTINCT FROM nc.next_class_date
+          )
+    """)
+
+    update_sql = text("""
+        WITH last_class AS (
+            SELECT
+                r.customer_ref_id,
+                MAX(r.check_in_date) AS last_class_date
+            FROM reservations r
+            WHERE r.account_id    = :account_id
+              AND r.status        = 'check in'
+              AND r.deleted_at    IS NULL
+              AND r.check_in_date IS NOT NULL
+            GROUP BY r.customer_ref_id
+        ),
+        next_class AS (
+            SELECT DISTINCT ON (r.customer_ref_id)
+                r.customer_ref_id,
+                cs.start_datetime AS next_class_date
+            FROM reservations r
+            INNER JOIN class_sessions cs
+                ON cs.id          = r.class_session_ref_id
+               AND cs.deleted_at  IS NULL
+            WHERE r.account_id = :account_id
+              AND r.status     = 'pending'
+              AND r.deleted_at IS NULL
+              AND cs.start_datetime > NOW()
+            ORDER BY r.customer_ref_id, cs.start_datetime ASC
+        )
+        UPDATE customers c
+        SET
+            last_class_date = lc.last_class_date,
+            next_class_date = nc.next_class_date,
+            updated_at      = NOW(),
+            updated_by      = -1
+        FROM
+            (SELECT id FROM customers WHERE account_id = :account_id) target
+        LEFT JOIN last_class lc ON lc.customer_ref_id = target.id
+        LEFT JOIN next_class nc ON nc.customer_ref_id = target.id
+        WHERE c.id = target.id
+          AND (
+            c.last_class_date IS DISTINCT FROM lc.last_class_date
+            OR
+            c.next_class_date IS DISTINCT FROM nc.next_class_date
+          )
+    """)
+
+    with engine.begin() as conn:
+        expected = conn.execute(count_sql, {"account_id": account_id}).scalar()
+
+    logger.info(f"[class_dates] expected to update: {expected} customers for account_id={account_id}")
+
+    if not update:
+        return {"expected": expected, "updated": None, "match": None}
+
+    with engine.begin() as conn:
+        result = conn.execute(update_sql, {"account_id": account_id})
+        updated = result.rowcount
+
+    match = updated == expected
+    if match:
+        logger.info(f"[class_dates] updated {updated} customers — count matches expected")
+    else:
+        diff_pct = abs(expected - updated) / expected * 100 if expected else 100
+        if diff_pct < 1:
+            logger.warning(f"[class_dates] minor count discrepancy ({diff_pct:.2f}%) — expected {expected}, updated {updated}")
+        else:
+            logger.error(f"[class_dates] count mismatch ({diff_pct:.2f}%) — expected {expected}, updated {updated}")
+
+    return {"expected": expected, "updated": updated, "match": match}
+
+
 VACUUM_TABLES = [
     "customers", "orders", "order_lines", "reservations",
     "class_sessions", "credit_transactions", "credit_transactions_orders",
@@ -174,6 +285,12 @@ async def async_stg_to_db_handler(event, context=None):
                 "table_results": successful_tables + failed_tables,
             }
 
+        try:
+            class_dates_result = _update_customer_class_dates(engine, account_id, update=True)
+        except Exception as e:
+            logger.error(f"[class_dates] failed for account_id={account_id}: {e}")
+            class_dates_result = {"expected": None, "updated": None, "match": None}
+
         post_ok = await post_processing_step(account_id, is_post_process)
         if not post_ok:
             return {
@@ -205,6 +322,9 @@ async def async_stg_to_db_handler(event, context=None):
                 "successful_tables": success_count,
                 "failed_tables": 0,
                 "total_records_inserted": total_processed,
+                "class_dates_expected": class_dates_result["expected"],
+                "class_dates_updated": class_dates_result["updated"],
+                "class_dates_match": class_dates_result["match"],
                 "elapsed_seconds": total_duration,
             },
             "table_results": successful_tables,
