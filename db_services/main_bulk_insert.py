@@ -35,7 +35,7 @@ TABLE_COLUMNS_MAP = {
     ],
     "class_sessions": [
         "id", "class_session_id", "start_datetime", "start_date", "location",
-        "end_datetime", "cancellation_datetime",
+        "end_datetime", "cancellation_datetime", "class_name", "class_type_name", "capacity",
         "created_at", "created_by", "updated_at", "updated_by", "deleted_at", "deleted_by",
         "account_id",
     ],
@@ -399,6 +399,52 @@ def stage_order_lines_only(bucket: str, account_id: str, engine) -> int:
     cleaned_rows = [clean_row(row, TABLE_COLUMNS_MAP["order_lines"]) for row in df.to_dict(orient="records")]
     bulk_insert("mt_order_lines_details_dlk", cleaned_rows, engine, columns=TABLE_COLUMNS_MAP["order_lines"])
     logger.info(f"[stage_order_lines_only] Staged {len(cleaned_rows)} rows")
+    return len(cleaned_rows)
+
+
+def stage_class_sessions_only(bucket: str, account_id: str, engine) -> int:
+    """
+    Create mt_class_sessions_details_dlk, fetch class_sessions parquet from S3,
+    and bulk-insert into staging. Returns number of rows staged.
+    Used by the backfill lambda.
+    """
+    create_sql = """
+        DROP TABLE IF EXISTS "mt_class_sessions_details_dlk";
+        CREATE TABLE "mt_class_sessions_details_dlk" (
+          id integer,
+          class_session_id text,
+          start_datetime timestamp(3) without time zone,
+          start_date text,
+          location text,
+          end_datetime timestamp(3) without time zone,
+          cancellation_datetime timestamp(3) without time zone,
+          class_name character varying(255),
+          class_type_name character varying(255),
+          capacity integer,
+          created_at timestamp(3) without time zone,
+          created_by integer,
+          updated_at timestamp(3) without time zone,
+          updated_by integer,
+          deleted_at timestamp(3) without time zone,
+          deleted_by integer,
+          account_id integer
+        );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(create_sql))
+    logger.info("[stage_class_sessions_only] Staging table ready")
+
+    config = TABLE_S3_CONFIG["class_sessions"]
+    prefix = f"{config['s3_prefix']}/account_id_{account_id}"
+    df = fetch_from_s3(bucket, prefix, account_id)
+    if df.empty:
+        logger.warning("[stage_class_sessions_only] No parquet files found in S3")
+        return 0
+
+    df = df.where(pd.notnull(df), None)
+    cleaned_rows = [clean_row(row, TABLE_COLUMNS_MAP["class_sessions"]) for row in df.to_dict(orient="records")]
+    bulk_insert("mt_class_sessions_details_dlk", cleaned_rows, engine, columns=TABLE_COLUMNS_MAP["class_sessions"])
+    logger.info(f"[stage_class_sessions_only] Staged {len(cleaned_rows)} rows")
     return len(cleaned_rows)
 
 

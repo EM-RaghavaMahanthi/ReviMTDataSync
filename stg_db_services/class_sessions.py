@@ -105,10 +105,12 @@ async def step_5_insert_new_records(account_id: str, location_id: int, engine):
         insert_sql = text("""
             INSERT INTO public.class_sessions (
               class_session_id, start_datetime, start_date, location, end_datetime, cancellation_datetime,
+              class_name, class_type_name, capacity,
               created_at, created_by, updated_at, updated_by, deleted_at, deleted_by, account_id
             )
             SELECT
               class_session_id, start_datetime, start_date, location, end_datetime, cancellation_datetime,
+              class_name, class_type_name, capacity,
               NOW() AS created_at, 1 AS created_by, NOW() AS updated_at, updated_by, deleted_at, deleted_by, account_id
             FROM mt_class_sessions_details_dlk
             WHERE account_id = :account_id

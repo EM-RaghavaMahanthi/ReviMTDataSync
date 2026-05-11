@@ -100,6 +100,9 @@ class ClassSessions(BaseModel):
     location: Optional[str] = None
     end_datetime: Optional[datetime] = None
     cancellation_datetime: Optional[datetime] = None
+    class_name: Optional[str] = None
+    class_type_name: Optional[str] = None
+    capacity: Optional[int] = None
     account_id: Optional[int] = None
     created_at: Optional[datetime] = None
     created_by: Optional[int] = None
