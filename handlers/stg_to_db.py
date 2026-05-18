@@ -160,10 +160,13 @@ VACUUM_TABLES = [
 
 
 def _vacuum_tables(engine):
+    import time
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         for table in VACUUM_TABLES:
             conn.execute(text(f"VACUUM ANALYZE {table}"))
             logger.info(f"[vacuum] VACUUM ANALYZE {table} done")
+    logger.info("[vacuum] all tables vacuumed — waiting 10s for stats to settle")
+    time.sleep(10)
 
 
 PROCESSING_ORDER = [

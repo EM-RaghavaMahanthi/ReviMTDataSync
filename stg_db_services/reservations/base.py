@@ -154,7 +154,7 @@ async def step_3_sync_first_timer_with_main_table(account_id: str, location_id: 
             if main_true_staging_false_count > 0:
                 update_1_result = conn.execute(text("""
                     UPDATE reservations r
-                    SET first_timer = FALSE
+                    SET first_timer = FALSE, updated_at = now()
                     FROM mt_reservations_details_dlk dlk
                     WHERE r.reservations_id = dlk.reservations_id
                       AND r.first_timer = TRUE
@@ -194,7 +194,7 @@ async def step_3_sync_first_timer_with_main_table(account_id: str, location_id: 
             if main_false_staging_true_count > 0:
                 update_2_result = conn.execute(text("""
                     UPDATE reservations r
-                    SET first_timer = TRUE
+                    SET first_timer = TRUE, updated_at = now()
                     FROM mt_reservations_details_dlk dlk
                     WHERE r.reservations_id = dlk.reservations_id
                       AND r.first_timer = FALSE
@@ -242,7 +242,7 @@ async def step_3_sync_first_timer_with_main_table(account_id: str, location_id: 
             if multiple_first_timers_count > 0:
                 update_3_result = conn.execute(text("""
                     UPDATE reservations r
-                    SET first_timer = FALSE
+                    SET first_timer = FALSE, updated_at = now()
                     WHERE r.reservations_id IN (
                       SELECT reservations_id
                       FROM (
