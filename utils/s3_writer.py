@@ -47,6 +47,37 @@ async def write_parquet_to_s3(
     logger.info(f"[S3] Uploaded {len(data)} records for {entity_type}={entity_id}, account_id={account_id} to s3://{settings.S3_BUCKET}/{key}")
     return key
 
+
+async def delete_account_prefix(account_id: str, s3_prefix: str) -> int:
+    """
+    Delete every existing object under {s3_prefix}/account_id_{account_id}/ before a
+    fresh sync, so stale parquet from a previous run can't linger and get re-ingested
+    by the downstream S3->staging step.
+
+    The prefix is built identically to write_parquet_to_s3's key, so it matches exactly
+    whatever that function wrote (including the trailing-slash quirk in some s3_prefix
+    values). Returns the number of objects deleted.
+    """
+    prefix = f"{s3_prefix}/account_id_{account_id}/"
+    deleted = 0
+    session = get_session()
+    async with session.create_client("s3", region_name=region) as s3_client:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(Bucket=settings.S3_BUCKET, Prefix=prefix):
+            contents = page.get("Contents", [])
+            if not contents:
+                continue
+            # list_objects_v2 returns <=1000 keys/page, within delete_objects' 1000 limit
+            await s3_client.delete_objects(
+                Bucket=settings.S3_BUCKET,
+                Delete={"Objects": [{"Key": o["Key"]} for o in contents], "Quiet": True},
+            )
+            deleted += len(contents)
+
+    logger.info(f"[S3] Cleared {deleted} stale object(s) under s3://{settings.S3_BUCKET}/{prefix}")
+    return deleted
+
+
 def refresh_source(name):
     """
     Deletes the log file (name.log) for a resource in S3.

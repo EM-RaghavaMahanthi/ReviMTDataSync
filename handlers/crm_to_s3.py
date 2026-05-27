@@ -264,6 +264,17 @@ async def async_lambda_handler(event, context):
 
         logger.info(f"[handler] account={account_id} integration_id={db_integration_id} crm_endpoint={db_crm_endpoint}")
 
+        # Clear stale parquet from a previous run for this account+resource before
+        # writing fresh data, so the S3->staging step never re-ingests orphaned files.
+        # Only the parent invocation cleans; child batch lambdas carry user_ids and
+        # must NOT delete, or they would wipe each other's output.
+        if not body.get("user_ids"):
+            from utils.s3_writer import delete_account_prefix
+            s3_prefix = settings.S3_PREFIXES.get(resource)
+            if s3_prefix:
+                logger.info(f"[handler] clearing old S3 records for resource={resource}, account={account_id}")
+                await delete_account_prefix(account_id, s3_prefix)
+
         # Route to correct processor
         if resource in ("customers", "orders", "order_lines", "class_sessions", "reservations"):
             try:
