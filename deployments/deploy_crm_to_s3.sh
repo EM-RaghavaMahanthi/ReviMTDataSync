@@ -23,6 +23,13 @@ PAGES_PER_SHARD="${PAGES_PER_SHARD:-200}"                     # pages per locati
 USER_BATCHES_PER_SHARD="${USER_BATCHES_PER_SHARD:-20}"        # 100-user batches per user_batch shard (~2 min/shard)
 CONCURRENCY_LIMIT="${CONCURRENCY_LIMIT:-16}"                  # in-flight cap (token bucket is the real limiter)
 
+# S3 prefixes for the new tags/notes datasets. Must match deploy_s3_to_db.sh's values —
+# Stage 1 writes here (via S3_PREFIXES, which prefers an s3_prefixes JSON blob if the
+# Lambda has one), Stage 2 reads the same value via its own individual env var.
+USER_NOTES_S3_PREFIX="${USER_NOTES_S3_PREFIX:-mariana-tek/raw-bulk-data/user_notes}"
+USER_TAGS_S3_PREFIX="${USER_TAGS_S3_PREFIX:-mariana-tek/raw-bulk-data/user_tags}"
+CUSTOMER_TAGS_S3_PREFIX="${CUSTOMER_TAGS_S3_PREFIX:-mariana-tek/raw-bulk-data/customer_tags}"
+
 info()    { echo "[INFO]  $*"; }
 success() { echo "[OK]    $*"; }
 error()   { echo "[ERROR] $*" >&2; exit 1; }
@@ -75,13 +82,30 @@ ENV_JSON="$(echo "$CURRENT_ENV" | jq -c \
     --arg pps "$PAGES_PER_SHARD" \
     --arg ubs "$USER_BATCHES_PER_SHARD" \
     --arg cl  "$CONCURRENCY_LIMIT" \
-    '{Variables: (. + {
+    --arg unp "$USER_NOTES_S3_PREFIX" \
+    --arg utp "$USER_TAGS_S3_PREFIX" \
+    --arg ctp "$CUSTOMER_TAGS_S3_PREFIX" \
+    '
+    (. + {
         PAGE_SIZE: $ps,
         CRM_MAX_REQUESTS_PER_MIN: $rpm,
         PAGES_PER_SHARD: $pps,
         USER_BATCHES_PER_SHARD: $ubs,
-        CONCURRENCY_LIMIT: $cl
-    })}')"
+        CONCURRENCY_LIMIT: $cl,
+        USER_NOTES_S3_PREFIX: $unp,
+        USER_TAGS_S3_PREFIX: $utp,
+        CUSTOMER_TAGS_S3_PREFIX: $ctp
+    })
+    # settings.S3_PREFIXES prefers an s3_prefixes JSON blob over the individual fields
+    # above when one is set on the Lambda — merge the new keys into it too so either
+    # mechanism resolves the same prefixes.
+    | if has("s3_prefixes") then
+        .s3_prefixes = ((.s3_prefixes | fromjson) + {
+            user_notes: $unp, user_tags: $utp, customer_tags: $ctp
+        } | tojson)
+      else . end
+    | {Variables: .}
+    ')"
 
 info "Setting handler + environment..."
 aws lambda update-function-configuration \
@@ -93,6 +117,6 @@ aws lambda update-function-configuration \
 
 info "Waiting for configuration update to complete..."
 aws lambda wait function-updated --function-name "$LAMBDA_NAME" \
-    && success "Done — $LAMBDA_NAME updated (handler + env: PAGE_SIZE=$PAGE_SIZE, CRM_MAX_REQUESTS_PER_MIN=$CRM_MAX_REQUESTS_PER_MIN, PAGES_PER_SHARD=$PAGES_PER_SHARD, USER_BATCHES_PER_SHARD=$USER_BATCHES_PER_SHARD, CONCURRENCY_LIMIT=$CONCURRENCY_LIMIT)."
+    && success "Done — $LAMBDA_NAME updated (handler + env: PAGE_SIZE=$PAGE_SIZE, CRM_MAX_REQUESTS_PER_MIN=$CRM_MAX_REQUESTS_PER_MIN, PAGES_PER_SHARD=$PAGES_PER_SHARD, USER_BATCHES_PER_SHARD=$USER_BATCHES_PER_SHARD, CONCURRENCY_LIMIT=$CONCURRENCY_LIMIT, USER_NOTES_S3_PREFIX=$USER_NOTES_S3_PREFIX, USER_TAGS_S3_PREFIX=$USER_TAGS_S3_PREFIX, CUSTOMER_TAGS_S3_PREFIX=$CUSTOMER_TAGS_S3_PREFIX)."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"
