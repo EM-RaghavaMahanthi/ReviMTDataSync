@@ -4,13 +4,13 @@ from pydantic import ValidationError
 
 from utils.api_client import api_get
 from core.config import settings
-from crm_sync._base import location_sync
+from crm_sync._base import location_sync, extract_tenant_name
 
 logger = logging.getLogger(__name__)
 _RESOURCE = "user_tags"
 
 
-def _map_record(u, account_id, location_id):
+def _map_record(u, account_id, location_id, tenant_name):
     """Map one /user_tags item to the UserTag schema (keep all attributes)."""
     from schemas.revi_schema import UserTag
     attrs = u.get("attributes", {})
@@ -18,6 +18,7 @@ def _map_record(u, account_id, location_id):
         "id": None,
         "tag_id": str(u["id"]) if u.get("id") is not None else None,
         "account_id": account_id,
+        "tenant_name": tenant_name,
         "location": int(location_id) if location_id is not None else None,
         "name": attrs.get("name"),
         "slug": attrs.get("slug"),
@@ -43,11 +44,12 @@ async def fetch_page(entity_id, page: int, account_id: str, api_base_url: str):
     page_size = getattr(settings, "PAGE_SIZE", 100)
     params = {"page": page, "page_size": page_size}
     resp = await api_get("/user_tags", api_base_url, params)
+    tenant_name = extract_tenant_name(api_base_url)
 
     valid = []
     for u in resp.get("data", []):
         try:
-            valid.append(_map_record(u, account_id, entity_id))
+            valid.append(_map_record(u, account_id, entity_id, tenant_name))
         except ValidationError as ve:
             logger.warning(f"[user_tags] Skipping id={u.get('id')}: {ve.errors()}")
         except Exception as e:

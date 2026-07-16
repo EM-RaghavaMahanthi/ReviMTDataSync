@@ -92,12 +92,12 @@ TABLE_COLUMNS_MAP = {
         "created_at", "created_by", "updated_at", "updated_by", "deleted_at", "deleted_by",
     ],
     "user_tags": [
-        "id", "tag_id", "account_id", "location", "name", "slug", "user_tag_type",
+        "id", "tag_id", "account_id", "tenant_name", "location", "name", "slug", "user_tag_type",
         "description", "tag_type", "weight",
         "created_at", "created_by", "updated_at", "updated_by", "deleted_at", "deleted_by",
     ],
     "customer_tags": [
-        "id", "account_id", "customer_id", "customer_ref_id", "tag_id",
+        "id", "account_id", "customer_id", "customer_ref_id", "tag_id", "tenant_name",
         "custom_tag_id", "default_tag_id", "location", "created_at", "created_by",
     ],
 }
@@ -120,7 +120,7 @@ VARCHAR_LIMITS = {
     "credit_transactions_type": 64, "membership_transactions_type": 64,
     "parent_credit_transaction_type": 64, "payment_sources_labels": 256,
     "name": 255, "slug": 255, "user_tag_type": 64, "tag_type": 64,
-    "note_id": 64, "author_id": 255, "tag_id": 64,
+    "note_id": 64, "author_id": 255, "tag_id": 64, "tenant_name": 100,
 }
 
 TABLE_S3_CONFIG = {

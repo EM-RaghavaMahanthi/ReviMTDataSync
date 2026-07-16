@@ -50,7 +50,7 @@ async def run(
     (unknown — no probe).
 
     Optional side output: if side_map_fn is given, each page's RAW response is passed to
-    side_map_fn(resp, account_id, entity_id) -> list[dict]; those rows are batched and
+    side_map_fn(resp, account_id, entity_id, api_base_url) -> list[dict]; those rows are batched and
     written to side_s3_prefix (entity_type=side_entity_type). Used to derive a second
     dataset (e.g. customer tag assignments) from the same fetch — no extra API call.
     """
@@ -107,7 +107,7 @@ async def run(
         if side_map_fn is None or not resp:
             return
         try:
-            side_batch.extend(side_map_fn(resp, account_id, entity_id))
+            side_batch.extend(side_map_fn(resp, account_id, entity_id, api_base_url))
         except Exception as e:
             logger.error(f"[{tag}] side_map_fn failed on a page: {e}")
 

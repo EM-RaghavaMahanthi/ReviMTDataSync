@@ -80,14 +80,20 @@ async def fetch_page(location_id: str, page: int, account_id: str, api_base_url:
     return valid, resp
 
 
-def _extract_tag_assignments(resp, account_id, location_id):
+def _extract_tag_assignments(resp, account_id, location_id, api_base_url):
     """
     side_map_fn for location_sync — derive customer→tag links from the customers response.
     Emits one CustomerTagAssignment row per (customer, tag) in relationships.tags, so a
     customer with N tags produces N rows. Refs (customer_ref_id, custom/default tag id)
     are resolved in Stage 3.
+
+    tenant_name (subdomain of api_base_url) is stamped on each row — Stage 3 needs it to
+    resolve default_tag_id, since customer_tags_default is keyed by (tenant_name, name),
+    not account_id.
     """
+    from crm_sync._base import extract_tenant_name
     from schemas.revi_schema import CustomerTagAssignment
+    tenant_name = extract_tenant_name(api_base_url)
     rows = []
     for u in resp.get("data", []):
         cust_id = str(u["id"]) if u.get("id") is not None else None
@@ -101,6 +107,7 @@ def _extract_tag_assignments(resp, account_id, location_id):
                     account_id=account_id,
                     customer_id=cust_id,
                     tag_id=str(tid),
+                    tenant_name=tenant_name,
                     location=int(location_id) if location_id is not None else None,
                 ).model_dump())
             except Exception as e:

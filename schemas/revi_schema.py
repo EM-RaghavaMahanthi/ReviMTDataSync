@@ -232,6 +232,8 @@ class UserTag(BaseModel):
     id: Optional[int] = None
     tag_id: Optional[str] = None            # data.id (matches relationships.tags ids on /api/users)
     account_id: Optional[int] = None
+    tenant_name: Optional[str] = None        # subdomain of crm_api_end_point — Stage 3 keys
+    #                                          customer_tags_default by (tenant_name, name), not account_id
     location: Optional[int] = None
     name: Optional[str] = None              # attributes.name
     slug: Optional[str] = None              # attributes.slug
@@ -280,6 +282,8 @@ class CustomerTagAssignment(BaseModel):
     customer_id: Optional[str] = None       # customers data.id (MT user id)
     customer_ref_id: Optional[int] = None   # resolved in Stage 3
     tag_id: Optional[str] = None            # relationships.tags[].id (MT user_tags id) — source
+    tenant_name: Optional[str] = None       # subdomain of crm_api_end_point — needed to resolve
+    #                                         default_tag_id via customer_tags_default(tenant_name, name)
     custom_tag_id: Optional[int] = None     # resolved in Stage 3 (tag_type == "manual")
     default_tag_id: Optional[int] = None    # resolved in Stage 3 (tag_type == "system")
     location: Optional[int] = None
