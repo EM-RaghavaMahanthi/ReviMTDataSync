@@ -30,7 +30,7 @@ TABLE_COLUMNS_MAP = {
         "email", "full_name", "birth_date", "birth_month", "birth_day", "phone_number",
         "address_line1", "address_line2", "address_line3", "city", "country",
         "state_province", "customer_state", "postal_code", "gender", "date_joined",
-        "is_opted_in_to_sms", "completed_class_count", "state_id",
+        "is_opted_in_to_sms", "completed_class_count", "tags", "state_id",
         "created_at", "created_by", "updated_at", "updated_by", "deleted_at", "deleted_by",
     ],
     "class_sessions": [

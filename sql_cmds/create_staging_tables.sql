@@ -58,6 +58,7 @@ CREATE TABLE "mt_customers_details_dlk" (
   date_joined timestamp(3) without time zone,
   is_opted_in_to_sms boolean,
   completed_class_count integer,
+  tags text,
   state_id integer,
   created_at timestamp(3) without time zone,
   created_by integer,

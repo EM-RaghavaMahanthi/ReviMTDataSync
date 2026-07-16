@@ -9,6 +9,8 @@ from core.logger import setup_logging
 setup_logging()
 
 from stg_db_services.customers import process_customers
+from stg_db_services.customer_notes import process_customer_notes
+from stg_db_services.customer_tags.base import process_customer_tags
 from stg_db_services.class_sessions import process_class_sessions
 from stg_db_services.membership_instances import process_membership_instances
 from stg_db_services.credit_transactions import process_credit_transactions
@@ -171,6 +173,8 @@ def _vacuum_tables(engine):
 
 PROCESSING_ORDER = [
     ("customers_01",                    process_customers),
+    ("customer_notes_01a",              process_customer_notes),
+    ("customer_tags_01b",               process_customer_tags),
     ("class_sessions_02",               process_class_sessions),
     ("membership_instances_03",         process_membership_instances),
     ("credit_transactions_04",          process_credit_transactions),
