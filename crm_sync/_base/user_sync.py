@@ -12,12 +12,112 @@ fetch_page_fn signature:
 import time
 import asyncio
 import logging
+from urllib.parse import parse_qs, urlparse
 
 from core.config import settings
 from utils.s3_writer import write_parquet_to_s3
 from crm_sync._base.dlq import write_failed, retry_failed
 
 logger = logging.getLogger(__name__)
+
+
+def _actual_last_page(resp: dict, reported: int) -> int:
+    """True last page from links.last (MT over-reports meta.pagination.pages)."""
+    last_url = (resp.get("links") or {}).get("last")
+    if last_url:
+        try:
+            page_vals = parse_qs(urlparse(last_url).query).get("page", [])
+            if page_vals:
+                return int(page_vals[0])
+        except (ValueError, TypeError):
+            pass
+    return reported
+
+
+async def run_resource_batched(
+    resource: str,
+    all_user_ids: list,
+    account_id: str,
+    api_base_url: str,
+    location_id: int,
+    fetch_page_fn,
+    s3_prefix: str,
+    batch_size: int = 100,
+    concurrency_limit: int = None,
+    parquet_batch_size: int = None,
+    entity_id: str = None,
+) -> tuple[int, int]:
+    """
+    Batched user sync: send `batch_size` (100) user ids per API call via repeated
+    &user= params. Chunks run sequentially; pages within a chunk are fetched
+    concurrently. Rate limiting is handled by the token bucket in api_client.
+    fetch_page_fn maps rows and takes a LIST of user ids:
+        async (user_ids, page, account_id, api_base_url, location_id=...) -> (rows, resp)
+    entity_id is the S3-filename tag; pass a shard-unique value (e.g. per user_offset)
+    so multiple user_batch shards of the same resource never collide on S3 keys.
+    Returns (total_processed, total_fetched).
+    """
+    if concurrency_limit is None:
+        concurrency_limit = settings.CONCURRENCY_LIMIT
+    if parquet_batch_size is None:
+        parquet_batch_size = int(settings.PARQUET_BATCH_SIZE)
+    if entity_id is None:
+        entity_id = f"{location_id}_ub"
+
+    tag = resource.upper()
+    start_time = time.time()
+    ids = [str(u) for u in all_user_ids]
+    chunks = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
+    logger.info(f"[{tag}] BATCH START: {len(ids)} users → {len(chunks)} chunk(s) of {batch_size}")
+
+    pending: list = []
+    file_num = 1
+    total_processed = 0
+    total_fetched = 0
+
+    for idx, chunk in enumerate(chunks, start=1):
+        # Walk every page for this 100-user chunk by following links.next — do NOT trust
+        # meta.pagination.pages, which MarianaTek can under-report for multi-user (?user=
+        # &user=…) queries and would cause us to stop after page 1 and drop transactions.
+        # A page fetch that fails after api_get's own retries raises → the shard fails and
+        # Step Functions retries it, rather than silently landing partial data.
+        rows: list = []
+        page = 1
+        while True:
+            data, resp = await fetch_page_fn(
+                chunk, page, account_id, api_base_url, location_id=location_id
+            )
+            rows.extend(data)
+            if not (resp.get("links") or {}).get("next"):
+                break
+            page += 1
+
+        total_fetched += len(rows)
+        pending.extend(rows)
+        logger.info(f"[{tag}] chunk {idx}/{len(chunks)}: {len(chunk)} users → {len(rows)} rows across {page} page(s)")
+
+        while len(pending) >= parquet_batch_size:
+            to_write = pending[:parquet_batch_size]
+            pending = pending[parquet_batch_size:]
+            await write_parquet_to_s3(
+                to_write, entity_id, file_num, account_id,
+                s3_prefix=s3_prefix, entity_type=resource,
+            )
+            total_processed += len(to_write)
+            file_num += 1
+
+    if pending:
+        await write_parquet_to_s3(
+            pending, entity_id, file_num, account_id,
+            s3_prefix=s3_prefix, entity_type=resource,
+        )
+        total_processed += len(pending)
+
+    logger.info(
+        f"[{tag}] BATCH DONE: processed={total_processed}, fetched={total_fetched}, "
+        f"elapsed={time.time() - start_time:.1f}s"
+    )
+    return total_processed, total_fetched
 
 
 async def _fetch_all_pages_for_user(

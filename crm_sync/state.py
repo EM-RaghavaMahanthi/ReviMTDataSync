@@ -1,0 +1,137 @@
+"""
+CRM sync shard planner — probes page 1 of each resource to compute total_pages,
+then splits the page range into fixed-size shards for the Step Functions fan-out.
+
+Each shard dict is a self-contained Lambda payload consumed by handlers/crm_to_s3.py:
+  location_shard    {mode, resource, page_start, page_end, account_id, location_id, api_base_url}
+  user_shard        {mode, resource, page_start, page_end, account_id, location_id, api_base_url}
+  user_batch_shard  {mode, resource,                       account_id, location_id, api_base_url}
+
+The probe is a raw api_get (no field mapping) — we only need meta.pagination / links.last.
+"""
+
+import os
+import asyncio
+import logging
+from urllib.parse import parse_qs, urlparse
+
+from core.config import settings
+from utils.api_client import api_get
+from crm_sync.config import RESOURCE_CONFIG, LOCATION_RESOURCES, USER_RESOURCES
+
+logger = logging.getLogger(__name__)
+
+_PAGES_PER_SHARD = int(os.environ.get("PAGES_PER_SHARD", getattr(settings, "PAGES_PER_SHARD", 200)))
+_USER_BATCHES_PER_SHARD = int(os.environ.get("USER_BATCHES_PER_SHARD", getattr(settings, "USER_BATCHES_PER_SHARD", 200)))
+
+
+def _actual_last_page(resp: dict, reported: int) -> int:
+    """
+    Parse the true last page from links.last. MarianaTek's links.last reflects
+    actual data; meta.pagination.pages can be over-reported. Falls back to reported.
+    """
+    last_url = (resp.get("links") or {}).get("last")
+    if last_url:
+        try:
+            page_vals = parse_qs(urlparse(last_url).query).get("page", [])
+            if page_vals:
+                return int(page_vals[0])
+        except (ValueError, TypeError):
+            pass
+    return reported
+
+
+async def _probe_total_pages(resource: str, location_id: int, api_base_url: str) -> int:
+    """Fetch page 1 (scoped to this tenant) and return the actual last page."""
+    cfg = RESOURCE_CONFIG[resource]
+    params = {
+        cfg["probe_param"]: location_id,
+        "page": 1,
+        "page_size": getattr(settings, "PAGE_SIZE", 100),
+    }
+    try:
+        resp = await api_get(cfg["endpoint"], api_base_url, params)
+        reported = int(resp.get("meta", {}).get("pagination", {}).get("pages", 1))
+        actual = _actual_last_page(resp, reported)
+        if actual != reported:
+            logger.info(f"[plan] {resource}: reported={reported} pages, actual={actual} (links.last)")
+        else:
+            logger.info(f"[plan] {resource}: {actual} total pages")
+        return actual
+    except Exception as e:
+        logger.error(f"[plan] {resource} probe failed: {e} — defaulting to 1 page")
+        return 1
+
+
+def _page_shards(mode: str, resource: str, total_pages: int, base: dict, pages_per_shard: int) -> list:
+    shards = []
+    for start in range(1, total_pages + 1, pages_per_shard):
+        end = min(start + pages_per_shard - 1, total_pages)
+        shards.append({**base, "mode": mode, "resource": resource, "page_start": start, "page_end": end})
+    return shards
+
+
+async def plan_location_shards(
+    account_id, location_id, api_base_url, tables: list = None, pages_per_shard: int = None,
+) -> list:
+    """Probe each location resource and split [1..total_pages] into page-range shards."""
+    if pages_per_shard is None:
+        pages_per_shard = _PAGES_PER_SHARD
+    loc_tables = [t for t in LOCATION_RESOURCES if (tables is None or t in tables)]
+    base = {"account_id": account_id, "location_id": location_id, "api_base_url": api_base_url}
+
+    probes = await asyncio.gather(*[_probe_total_pages(r, location_id, api_base_url) for r in loc_tables])
+
+    shards = []
+    for resource, total_pages in zip(loc_tables, probes):
+        shards += _page_shards("location_shard", resource, total_pages, base, pages_per_shard)
+
+    logger.info(f"[plan] {len(shards)} location shards across {len(loc_tables)} resources")
+    return shards
+
+
+async def plan_user_shards(
+    account_id, location_id, api_base_url,
+    pages_per_shard: int = None, batches_per_shard: int = None,
+) -> list:
+    """
+    "user" resources (membership_instances) → fixed page-range shards (whole tenant
+    downloaded unfiltered, filtered client-side later).
+    "user_batch" resources (credit_transactions, membership_transactions) → sharded by
+    100-user batches: the number of batches == the customers page count (100 users/page
+    == 100 users/batch), which we probe here. Each shard covers `batches_per_shard`
+    consecutive batches (a user-id offset/limit slice resolved at run time). Since each
+    batch is usually ~1 page, this ≈ pages_per_shard pages/shard, overshooting when a
+    batch's users span multiple pages.
+    """
+    if pages_per_shard is None:
+        pages_per_shard = _PAGES_PER_SHARD
+    if batches_per_shard is None:
+        batches_per_shard = _USER_BATCHES_PER_SHARD
+    base = {"account_id": account_id, "location_id": location_id, "api_base_url": api_base_url}
+
+    batch_resources = [r for r in USER_RESOURCES if RESOURCE_CONFIG[r]["fetch_type"] == "user_batch"]
+    paged_resources = [r for r in USER_RESOURCES if RESOURCE_CONFIG[r]["fetch_type"] == "user"]
+
+    shards = []
+
+    # user_batch: probe customers to get the batch count (= customers page count), then
+    # split the customer space into user-offset/limit shards of `batches_per_shard` batches.
+    if batch_resources:
+        total_batches = await _probe_total_pages("customers", location_id, api_base_url)
+        users_per_shard = batches_per_shard * 100
+        total_users = total_batches * 100  # ceil(count/100)*100 — >= actual customer count
+        for resource in batch_resources:
+            for offset in range(0, max(total_users, 1), users_per_shard):
+                shards.append({
+                    **base, "mode": "user_batch_shard", "resource": resource,
+                    "user_offset": offset, "user_limit": users_per_shard,
+                })
+
+    # Page-range shards for unfiltered "user" resources.
+    probes = await asyncio.gather(*[_probe_total_pages(r, location_id, api_base_url) for r in paged_resources])
+    for resource, total_pages in zip(paged_resources, probes):
+        shards += _page_shards("user_shard", resource, total_pages, base, pages_per_shard)
+
+    logger.info(f"[plan] {len(shards)} user shards across {len(USER_RESOURCES)} resources")
+    return shards

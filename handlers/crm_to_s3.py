@@ -2,10 +2,12 @@ import json
 import asyncio
 import time
 import re
+import importlib
 import logging
 from typing import List
 from core.config import settings
 from core.logger import setup_logging
+import utils.api_client as _api_client
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -208,6 +210,123 @@ async def _process_user_batch_resource(resource: str, event_body: dict, context,
 
 
 # ---------------------------------------------------------------------------
+# Step Functions shard-mode handlers (Stage 1: Plan -> LocationMap -> UserMap)
+# ---------------------------------------------------------------------------
+
+async def _handle_plan(body: dict) -> dict:
+    """
+    mode=plan — clear stale S3 for this account (once), probe each resource's page
+    count and return fixed page-range shard lists for LocationMap and UserMap.
+    """
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+
+    # One-time stale-clear for every resource prefix — shards only append afterwards,
+    # so clearing here (not per-shard) prevents shards from wiping each other's output.
+    from utils.s3_writer import delete_account_prefix
+    for resource, prefix in settings.S3_PREFIXES.items():
+        if prefix:
+            await delete_account_prefix(account_id, prefix)
+
+    from crm_sync.state import plan_location_shards, plan_user_shards
+    location_shards, user_shards = await asyncio.gather(
+        plan_location_shards(account_id, location_id, api_base_url),
+        plan_user_shards(account_id, location_id, api_base_url),
+    )
+    logger.info(f"[plan] account={account_id}: {len(location_shards)} location + {len(user_shards)} user shards")
+    return {
+        "status": "success",
+        "account_id": account_id,
+        "location_id": location_id,
+        "api_base_url": api_base_url,
+        "location_shards": location_shards,
+        "user_shards": user_shards,
+        "shard_count": len(location_shards) + len(user_shards),
+    }
+
+
+async def _handle_location_shard(body: dict) -> dict:
+    """mode=location_shard — fetch a fixed page range for one location resource."""
+    from crm_sync._base import location_sync
+    resource = body["resource"]
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+    page_start = int(body["page_start"])
+    page_end = int(body["page_end"])
+
+    mod = importlib.import_module(f"crm_sync.{resource}")
+    processed, expected = await location_sync.run(
+        location_id, account_id, api_base_url,
+        fetch_page_fn=mod.fetch_page,
+        s3_prefix=settings.S3_PREFIXES[resource],
+        resource=resource,
+        page_start=page_start,
+        page_end=page_end,
+    )
+    return {"status": "success", "resource": resource, "page_start": page_start,
+            "page_end": page_end, "records": processed}
+
+
+async def _handle_user_shard(body: dict) -> dict:
+    """mode=user_shard — unfiltered page range for membership_instances, filtered by customer_ids."""
+    from utils.s3_writer import read_customer_ids_from_s3
+    resource = body["resource"]
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+    page_start = int(body["page_start"])
+    page_end = int(body["page_end"])
+
+    customer_ids = await read_customer_ids_from_s3(account_id)
+    mod = importlib.import_module(f"crm_sync.{resource}")
+    processed, fetched = await mod.process_unfiltered_shard(
+        account_id, location_id, api_base_url, customer_ids, page_start, page_end
+    )
+    return {"status": "success", "resource": resource, "page_start": page_start,
+            "page_end": page_end, "records": processed, "fetched": fetched}
+
+
+async def _handle_user_batch_shard(body: dict) -> dict:
+    """
+    mode=user_batch_shard — a slice of customers (user_offset..user_offset+user_limit),
+    100 ids/call via repeated &user=. The slice keeps each shard bounded (~batches/pages).
+    """
+    from utils.s3_writer import read_customer_ids_from_s3
+    resource = body["resource"]
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+    user_offset = int(body.get("user_offset", 0))
+    user_limit = body.get("user_limit")
+
+    all_ids = await read_customer_ids_from_s3(account_id)
+    ids = all_ids[user_offset:] if user_limit is None else all_ids[user_offset:user_offset + int(user_limit)]
+    if not ids:
+        logger.info(f"[user_batch_shard] {resource} offset={user_offset}: empty slice — skipping")
+        return {"status": "success", "resource": resource, "records": 0, "fetched": 0,
+                "user_offset": user_offset}
+
+    # Shard-unique S3 tag so slices of the same resource don't collide on S3 keys.
+    shard_tag = f"{location_id}_ub_{user_offset}"
+    mod = importlib.import_module(f"crm_sync.{resource}")
+    processed, fetched = await mod.process_resource_batched(
+        ids, account_id, api_base_url, location_id, shard_tag=shard_tag
+    )
+    return {"status": "success", "resource": resource, "records": processed,
+            "fetched": fetched, "user_offset": user_offset, "users": len(ids)}
+
+
+_MODE_HANDLERS = {
+    "plan": _handle_plan,
+    "location_shard": _handle_location_shard,
+    "user_shard": _handle_user_shard,
+    "user_batch_shard": _handle_user_batch_shard,
+}
+
+
+# ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
 
@@ -216,8 +335,32 @@ async def async_lambda_handler(event, context):
     account_id = None
     resource = "unknown"
 
+    # Reset per-invocation state that is bound to the asyncio.run() event loop, which
+    # is closed on the next warm-start call: the shared aiohttp session, and the token
+    # buckets (each holds an asyncio.Lock bound to the loop that first used it — reusing
+    # a stale one on a warm container raises "bound to a different event loop").
+    # A fresh bucket per shard is also correct: bursts are capped and shards are
+    # sequential, so the rolling-window rate stays under the CRM limit.
+    _api_client._session = None
+    _api_client._buckets.clear()
+
+    body = get_event_body(event)
+
+    # Step Functions shard-mode dispatch (Stage 1: Plan -> LocationMap -> UserMap).
+    mode = body.get("mode")
+    if mode:
+        handler = _MODE_HANDLERS.get(mode)
+        if not handler:
+            return {"status": "error", "error": f"Unknown mode '{mode}'"}
+        try:
+            return await handler(body)
+        except Exception as exc:
+            logger.critical(f"[handler] mode={mode} failed for account={body.get('account_id')}: {exc}")
+            raise
+        finally:
+            await _api_client.close_session()
+
     try:
-        body = get_event_body(event)
         resource = body.get("resource", "customers")
         account_id = body.get("account_id")
         api_base_url = body.get("api_base_url")
@@ -354,6 +497,8 @@ async def async_lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps(f"Lambda failed: {exc}"),
         }
+    finally:
+        await _api_client.close_session()
 
 
 def lambda_handler(event, context):

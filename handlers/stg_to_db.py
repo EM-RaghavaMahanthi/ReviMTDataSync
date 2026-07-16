@@ -270,23 +270,9 @@ async def async_stg_to_db_handler(event, context=None):
         logger.info(f"stg_to_db done — {success_count}/{total_tables} tables, {total_processed} records, {total_duration}s")
 
         if failure_count > 0:
-            await _notify_stage3(account_id, "error", success_count, total_tables,
-                                 total_processed, failed_tables, total_duration)
-            return {
-                "status": "error",
-                "account_id": account_id,
-                "location_id": location_id,
-                "error": f"{failure_count}/{total_tables} tables failed",
-                "post_process_successful": False,
-                "summary": {
-                    "total_tables": total_tables,
-                    "successful_tables": success_count,
-                    "failed_tables": failure_count,
-                    "total_records_inserted": total_processed,
-                    "elapsed_seconds": total_duration,
-                },
-                "table_results": successful_tables + failed_tables,
-            }
+            # Fail so Step Functions retries, then routes to a Fail state (redrive).
+            # No Teams ping on failure — it would fire on every retry attempt.
+            raise Exception(f"stg_to_db: {failure_count}/{total_tables} tables failed: {failed_tables}")
 
         try:
             class_dates_result = _update_customer_class_dates(engine, account_id, update=True)
@@ -296,21 +282,7 @@ async def async_stg_to_db_handler(event, context=None):
 
         post_ok = await post_processing_step(account_id, is_post_process)
         if not post_ok:
-            return {
-                "status": "error",
-                "account_id": account_id,
-                "location_id": location_id,
-                "error": "All tables succeeded but post-processing failed",
-                "post_process_successful": False,
-                "summary": {
-                    "total_tables": total_tables,
-                    "successful_tables": success_count,
-                    "failed_tables": 0,
-                    "total_records_inserted": total_processed,
-                    "elapsed_seconds": total_duration,
-                },
-                "table_results": successful_tables,
-            }
+            raise Exception("stg_to_db: all tables succeeded but post-processing failed")
 
         await _notify_stage3(account_id, "success", success_count, total_tables,
                              total_processed, [], total_duration)
@@ -336,14 +308,7 @@ async def async_stg_to_db_handler(event, context=None):
     except Exception as e:
         elapsed = round(time.time() - start_time, 2)
         logger.error(f"stg_to_db failed completely: {e}")
-        await _notify_stage3(account_id, "error", 0, len(PROCESSING_ORDER), 0, [], elapsed)
-        return {
-            "status": "error",
-            "account_id": account_id,
-            "location_id": location_id,
-            "error": str(e),
-            "elapsed_seconds": elapsed,
-        }
+        raise
     finally:
         engine.dispose()
 

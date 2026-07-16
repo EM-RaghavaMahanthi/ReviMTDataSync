@@ -14,8 +14,18 @@ class Settings(BaseSettings):
     API_BASE_URL: str = "https://revelmethod.marianatek.com/api"  # Added field
     PARQUET_BATCH_SIZE: int = 1000
     S3_BUCKET: str
-    CONCURRENCY_LIMIT: int = 20
-    PAGE_SIZE: int = 500
+    CONCURRENCY_LIMIT: int = 16
+    PAGE_SIZE: int = 100  # MarianaTek hard-caps page_size at 100 on all endpoints
+
+    # Per-tenant request rate cap (50% of MarianaTek's 200 req/min ceiling — headroom
+    # for the in-process token bucket in utils/api_client.py). Read there via os.environ.
+    CRM_MAX_REQUESTS_PER_MIN: int = 100
+    # Pages per Step Functions shard (crm_sync/state.py splits [1..total_pages] by this).
+    PAGES_PER_SHARD: int = 200
+    # 100-user batches per user_batch shard (credit_transactions, membership_transactions).
+    # pages/shard ≈ USER_BATCHES_PER_SHARD × txns_per_user; time ≈ pages / CRM_MAX_REQUESTS_PER_MIN.
+    # 20 batches × ~10 txns/user ≈ 200 pages ≈ ~2 min/shard. Lower for txn-heavy tenants.
+    USER_BATCHES_PER_SHARD: int = 20
 
     CHECK_STALE_DATA: bool = False  # New setting to enable/disable stale data checking
 

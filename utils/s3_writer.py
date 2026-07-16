@@ -78,6 +78,37 @@ async def delete_account_prefix(account_id: str, s3_prefix: str) -> int:
     return deleted
 
 
+async def read_customer_ids_from_s3(account_id: str, customers_prefix: str = None) -> list:
+    """
+    Read customer_id values from the customers parquet written earlier in this run.
+    Files live at: {customers_prefix}/account_id_{account_id}/location_*_batch_*.parquet
+    Used to seed user-based resource syncs without re-hitting the customers API.
+    Reads only the 'customer_id' column to avoid loading full row groups.
+    """
+    if customers_prefix is None:
+        customers_prefix = settings.S3_PREFIXES["customers"]
+    prefix = f"{customers_prefix}/account_id_{account_id}/"
+
+    session = get_session()
+    customer_ids: list = []
+    async with session.create_client("s3", region_name=region) as s3_client:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        keys = []
+        async for page in paginator.paginate(Bucket=settings.S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if obj["Key"].endswith(".parquet"):
+                    keys.append(obj["Key"])
+
+        for key in keys:
+            resp = await s3_client.get_object(Bucket=settings.S3_BUCKET, Key=key)
+            body = await resp["Body"].read()
+            table = pq.read_table(io.BytesIO(body), columns=["customer_id"])
+            customer_ids.extend(str(v) for v in table.column("customer_id").to_pylist() if v)
+
+    logger.info(f"[S3] Read {len(customer_ids)} customer_ids from s3://{settings.S3_BUCKET}/{prefix}")
+    return customer_ids
+
+
 def refresh_source(name):
     """
     Deletes the log file (name.log) for a resource in S3.

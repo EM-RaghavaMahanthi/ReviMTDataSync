@@ -1,0 +1,39 @@
+"""
+Per-resource CRM sync metadata — drives the shard planner (crm_sync/state.py) and
+the Stage-1 mode dispatch (handlers/crm_to_s3.py).
+
+Unlike revi-dlk-bronze, ReviSync keeps its per-resource field mapping in each
+crm_sync/<resource>.py module (the parquet written here feeds Stage 2/3, which
+expect the mapped schema). So this config carries only orchestration metadata:
+
+  endpoint     — CRM path, used by the planner to probe page 1
+  fetch_type   — how the resource is sharded / fetched:
+                   "location"   → paginated by location; fixed page-range shards
+                   "user"       → small table, downloaded whole per tenant (unfiltered
+                                  by `location`) then filtered client-side by customer_id;
+                                  fixed page-range shards
+                   "user_batch" → one shard per resource; customer_ids read from the
+                                  customers parquet, sent 100/call via repeated &user=
+  probe_param  — query param the planner uses to scope the page-1 probe to this tenant
+                 (location / user resources only)
+  batch_size   — user IDs per API call (user_batch resources only)
+"""
+
+LOCATION_RESOURCES = ["customers", "orders", "order_lines", "class_sessions", "reservations"]
+USER_RESOURCES     = ["credit_transactions", "membership_instances", "membership_transactions"]
+ALL_RESOURCES      = LOCATION_RESOURCES + USER_RESOURCES
+
+RESOURCE_CONFIG: dict = {
+    "customers":      {"endpoint": "/users",          "fetch_type": "location", "probe_param": "home_location"},
+    "orders":         {"endpoint": "/orders",         "fetch_type": "location", "probe_param": "location"},
+    "order_lines":    {"endpoint": "/order_lines",    "fetch_type": "location", "probe_param": "location"},
+    "class_sessions": {"endpoint": "/class_sessions", "fetch_type": "location", "probe_param": "location"},
+    "reservations":   {"endpoint": "/reservations",   "fetch_type": "location", "probe_param": "location"},
+
+    # Small table — download the whole tenant unfiltered, then filter by customer_id.
+    "membership_instances": {"endpoint": "/membership_instances", "fetch_type": "user", "probe_param": "location"},
+
+    # Batched by repeated &user= (100 ids/call); one shard per resource.
+    "credit_transactions":     {"endpoint": "/credit_transactions",     "fetch_type": "user_batch", "batch_size": 100},
+    "membership_transactions": {"endpoint": "/membership_transactions", "fetch_type": "user_batch", "batch_size": 100},
+}

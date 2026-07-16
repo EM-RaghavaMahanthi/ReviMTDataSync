@@ -81,24 +81,19 @@ def lambda_handler(event, context=None):
                 for tbl, r in stale_results.get("tables", {}).items()
             }
 
-        _notify_stage2(account_id, overall_success, failed_tables, elapsed)
-
         if not overall_success:
+            # Fail the invocation so Step Functions retries, then routes to a Fail
+            # state (enabling redrive). No Teams ping on failure — it would fire on
+            # every retry attempt; the SFN Fail / redrive is the failure signal.
             raise Exception(f"ETL stage 2 failed: {failed_tables}")
 
+        _notify_stage2(account_id, overall_success, failed_tables, elapsed)
         return response
 
     except Exception as e:
         elapsed = round(time.time() - start, 2)
         logger.error(f"Lambda failed — account={account_id}: {e}")
-        _notify_stage2(account_id, False, [], elapsed)
-        return {
-            "status": "error",
-            "error": str(e),
-            "account_id": account_id,
-            "location_id": location_id,
-            "elapsed_time_seconds": elapsed,
-        }
+        raise
     finally:
         db.close()
 

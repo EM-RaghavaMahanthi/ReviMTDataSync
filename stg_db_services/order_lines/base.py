@@ -153,7 +153,12 @@ async def process_order_lines(account_id: str, location_id: int, engine):
             "membership_missing_percentage": membership_missing_percentage,
             "other_missing_percentage": other_missing_percentage
         }
-        
+
+        # Expose the total at the top level too — the stg_to_db handler reads
+        # result.get("inserted_records") uniformly across all tables, and without
+        # this it would report 0 for order_lines (the real total is under summary).
+        results["inserted_records"] = total_inserted
+
         return results
         
     except Exception as e:
