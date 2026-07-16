@@ -86,6 +86,20 @@ TABLE_COLUMNS_MAP = {
         "location", "created_at", "created_by", "updated_at", "updated_by",
         "deleted_at", "deleted_by", "transaction_type",
     ],
+    "user_notes": [
+        "id", "account_id", "customer_id", "customer_ref_id", "note_id", "note",
+        "note_datetime", "is_pinned", "author_id", "location",
+        "created_at", "created_by", "updated_at", "updated_by", "deleted_at", "deleted_by",
+    ],
+    "user_tags": [
+        "id", "tag_id", "account_id", "location", "name", "slug", "user_tag_type",
+        "description", "tag_type", "weight",
+        "created_at", "created_by", "updated_at", "updated_by", "deleted_at", "deleted_by",
+    ],
+    "customer_tags": [
+        "id", "account_id", "customer_id", "customer_ref_id", "tag_id",
+        "custom_tag_id", "default_tag_id", "location", "created_at", "created_by",
+    ],
 }
 
 DATETIME_COLUMNS = {
@@ -93,6 +107,7 @@ DATETIME_COLUMNS = {
     "date_placed", "start_datetime", "start_date", "end_datetime",
     "cancellation_datetime", "transaction_date", "payment_interval_end_date",
     "purchase_date", "next_charge_date", "cancel_date", "check_in_date", "creation_date",
+    "note_datetime",
 }
 
 VARCHAR_LIMITS = {
@@ -104,6 +119,8 @@ VARCHAR_LIMITS = {
     "processed_by": 64, "reservation_type": 64, "transaction_type": 64,
     "credit_transactions_type": 64, "membership_transactions_type": 64,
     "parent_credit_transaction_type": 64, "payment_sources_labels": 256,
+    "name": 255, "slug": 255, "user_tag_type": 64, "tag_type": 64,
+    "note_id": 64, "author_id": 255, "tag_id": 64,
 }
 
 TABLE_S3_CONFIG = {
@@ -115,6 +132,9 @@ TABLE_S3_CONFIG = {
     "membership_instances":    {"s3_prefix": settings.MEMBERSHIP_INSTANCES_S3_PREFIX,    "staging_table": "mt_membership_instances_details_dlk"},
     "credit_transactions":     {"s3_prefix": settings.CREDIT_TRANSACTIONS_S3_PREFIX,     "staging_table": "mt_credit_transactions_details_dlk"},
     "membership_transactions": {"s3_prefix": settings.MEMBERSHIP_TRANSACTIONS_S3_PREFIX, "staging_table": "mt_membership_transactions_details_dlk"},
+    "user_notes":              {"s3_prefix": settings.USER_NOTES_S3_PREFIX,               "staging_table": "mt_user_notes_details_dlk"},
+    "user_tags":               {"s3_prefix": settings.USER_TAGS_S3_PREFIX,                "staging_table": "mt_user_tags_details_dlk"},
+    "customer_tags":           {"s3_prefix": settings.CUSTOMER_TAGS_S3_PREFIX,            "staging_table": "mt_customer_tags_details_dlk"},
 }
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@ then splits the page range into fixed-size shards for the Step Functions fan-out
 Each shard dict is a self-contained Lambda payload consumed by handlers/crm_to_s3.py:
   location_shard    {mode, resource, page_start, page_end, account_id, location_id, api_base_url}
   user_shard        {mode, resource, page_start, page_end, account_id, location_id, api_base_url}
-  user_batch_shard  {mode, resource,                       account_id, location_id, api_base_url}
+  user_batch_shard  {mode, resource, user_offset, user_limit, account_id, location_id, api_base_url}
+  tenant_shard      {mode, resource,                       account_id, location_id, api_base_url}
 
 The probe is a raw api_get (no field mapping) — we only need meta.pagination / links.last.
 """
@@ -17,7 +18,9 @@ from urllib.parse import parse_qs, urlparse
 
 from core.config import settings
 from utils.api_client import api_get
-from crm_sync.config import RESOURCE_CONFIG, LOCATION_RESOURCES, USER_RESOURCES
+from crm_sync.config import (
+    RESOURCE_CONFIG, LOCATION_RESOURCES, USER_RESOURCES, NOTES_RESOURCES, TENANT_RESOURCES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +45,11 @@ def _actual_last_page(resp: dict, reported: int) -> int:
 
 
 async def _probe_total_pages(resource: str, location_id: int, api_base_url: str) -> int:
-    """Fetch page 1 (scoped to this tenant) and return the actual last page."""
+    """Fetch page 1 and return the actual last page. probe_param=None → no scoping filter."""
     cfg = RESOURCE_CONFIG[resource]
-    params = {
-        cfg["probe_param"]: location_id,
-        "page": 1,
-        "page_size": getattr(settings, "PAGE_SIZE", 100),
-    }
+    params = {"page": 1, "page_size": getattr(settings, "PAGE_SIZE", 100)}
+    if cfg.get("probe_param"):
+        params[cfg["probe_param"]] = location_id
     try:
         resp = await api_get(cfg["endpoint"], api_base_url, params)
         reported = int(resp.get("meta", {}).get("pagination", {}).get("pages", 1))
@@ -92,7 +93,7 @@ async def plan_location_shards(
 
 async def plan_user_shards(
     account_id, location_id, api_base_url,
-    pages_per_shard: int = None, batches_per_shard: int = None,
+    pages_per_shard: int = None, batches_per_shard: int = None, tables: list = None,
 ) -> list:
     """
     "user" resources (membership_instances) → fixed page-range shards (whole tenant
@@ -110,8 +111,15 @@ async def plan_user_shards(
         batches_per_shard = _USER_BATCHES_PER_SHARD
     base = {"account_id": account_id, "location_id": location_id, "api_base_url": api_base_url}
 
-    batch_resources = [r for r in USER_RESOURCES if RESOURCE_CONFIG[r]["fetch_type"] == "user_batch"]
-    paged_resources = [r for r in USER_RESOURCES if RESOURCE_CONFIG[r]["fetch_type"] == "user"]
+    def _want(r):
+        return tables is None or r in tables
+
+    batch_resources = [r for r in USER_RESOURCES if RESOURCE_CONFIG[r]["fetch_type"] == "user_batch" and _want(r)]
+    # "user" (unfiltered, page-range) resources: membership_instances + user_notes.
+    paged_resources = (
+        [r for r in USER_RESOURCES if RESOURCE_CONFIG[r]["fetch_type"] == "user" and _want(r)]
+        + [r for r in NOTES_RESOURCES if _want(r)]
+    )
 
     shards = []
 
@@ -128,10 +136,15 @@ async def plan_user_shards(
                     "user_offset": offset, "user_limit": users_per_shard,
                 })
 
-    # Page-range shards for unfiltered "user" resources.
+    # Page-range shards for unfiltered "user" resources (membership_instances, user_notes).
     probes = await asyncio.gather(*[_probe_total_pages(r, location_id, api_base_url) for r in paged_resources])
     for resource, total_pages in zip(paged_resources, probes):
         shards += _page_shards("user_shard", resource, total_pages, base, pages_per_shard)
 
-    logger.info(f"[plan] {len(shards)} user shards across {len(USER_RESOURCES)} resources")
+    # Tenant-wide lookups (user_tags) — one tiny shard each, no page range.
+    for resource in TENANT_RESOURCES:
+        if _want(resource):
+            shards.append({**base, "mode": "tenant_shard", "resource": resource})
+
+    logger.info(f"[plan] {len(shards)} user/notes/tenant shards")
     return shards

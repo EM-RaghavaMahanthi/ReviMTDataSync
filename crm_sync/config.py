@@ -9,19 +9,28 @@ expect the mapped schema). So this config carries only orchestration metadata:
   endpoint     — CRM path, used by the planner to probe page 1
   fetch_type   — how the resource is sharded / fetched:
                    "location"   → paginated by location; fixed page-range shards
-                   "user"       → small table, downloaded whole per tenant (unfiltered
-                                  by `location`) then filtered client-side by customer_id;
-                                  fixed page-range shards
+                   "user"       → downloaded whole per tenant then filtered client-side by
+                                  customer_id; fixed page-range shards. probe_param="location"
+                                  scopes the fetch to a location; probe_param=None paginates
+                                  the entire endpoint (no filter at all).
                    "user_batch" → one shard per resource; customer_ids read from the
                                   customers parquet, sent 100/call via repeated &user=
-  probe_param  — query param the planner uses to scope the page-1 probe to this tenant
-                 (location / user resources only)
+                   "tenant"     → tiny tenant-wide lookup; one shard, paginate all, keep all
+                                  (no client-side filter)
+  probe_param  — query param the planner uses to scope the page-1 probe to this tenant;
+                 None = no scoping param (paginate the whole endpoint)
   batch_size   — user IDs per API call (user_batch resources only)
 """
 
 LOCATION_RESOURCES = ["customers", "orders", "order_lines", "class_sessions", "reservations"]
 USER_RESOURCES     = ["credit_transactions", "membership_instances", "membership_transactions"]
-ALL_RESOURCES      = LOCATION_RESOURCES + USER_RESOURCES
+# New (tags & notes). Kept in separate lists so the existing pipeline is untouched until the
+# planner/handler wiring is done. user_notes reuses the "user_shard" path (unfiltered + client
+# filter); user_tags is a "tenant" lookup; customer tag assignments are derived from the
+# customers fetch (no dedicated endpoint).
+NOTES_RESOURCES    = ["user_notes"]
+TENANT_RESOURCES   = ["user_tags"]
+ALL_RESOURCES      = LOCATION_RESOURCES + USER_RESOURCES + NOTES_RESOURCES + TENANT_RESOURCES
 
 RESOURCE_CONFIG: dict = {
     "customers":      {"endpoint": "/users",          "fetch_type": "location", "probe_param": "home_location"},
@@ -36,4 +45,9 @@ RESOURCE_CONFIG: dict = {
     # Batched by repeated &user= (100 ids/call); one shard per resource.
     "credit_transactions":     {"endpoint": "/credit_transactions",     "fetch_type": "user_batch", "batch_size": 100},
     "membership_transactions": {"endpoint": "/membership_transactions", "fetch_type": "user_batch", "batch_size": 100},
+
+    # Notes: whole-tenant download (NO location filter), filtered by customer_id client-side.
+    "user_notes": {"endpoint": "/user_notes", "fetch_type": "user", "probe_param": None},
+    # Tags: tiny tenant-wide lookup table (id → name/tag_type); keep all rows.
+    "user_tags":  {"endpoint": "/user_tags",  "fetch_type": "tenant", "probe_param": None},
 }

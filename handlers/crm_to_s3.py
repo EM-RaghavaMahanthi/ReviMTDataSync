@@ -246,6 +246,48 @@ async def _handle_plan(body: dict) -> dict:
     }
 
 
+# Notes/tags backfill: fetch ONLY these CRM resources (customers is needed for the tag
+# assignments and for the customer_ids that filter notes). Dedicated to the backfill
+# state machine — the main `plan` above is untouched.
+_BACKFILL_LOCATION_TABLES = ["customers"]
+_BACKFILL_USER_TABLES = ["user_notes", "user_tags"]
+
+
+async def _handle_backfill_plan(body: dict) -> dict:
+    """
+    mode=backfill_plan — like plan, but scoped to customers + user_notes + user_tags,
+    so old accounts can be backfilled with just tags & notes (no orders/reservations/etc).
+    """
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+
+    # Scoped stale-clear: only the datasets this backfill writes (customers + its
+    # customer_tags side output + user_notes + user_tags).
+    from utils.s3_writer import delete_account_prefix
+    clear_keys = set(_BACKFILL_LOCATION_TABLES) | set(_BACKFILL_USER_TABLES) | {"customer_tags"}
+    for key in clear_keys:
+        prefix = settings.S3_PREFIXES.get(key)
+        if prefix:
+            await delete_account_prefix(account_id, prefix)
+
+    from crm_sync.state import plan_location_shards, plan_user_shards
+    location_shards, user_shards = await asyncio.gather(
+        plan_location_shards(account_id, location_id, api_base_url, tables=_BACKFILL_LOCATION_TABLES),
+        plan_user_shards(account_id, location_id, api_base_url, tables=_BACKFILL_USER_TABLES),
+    )
+    logger.info(f"[backfill_plan] account={account_id}: {len(location_shards)} location + {len(user_shards)} user shards")
+    return {
+        "status": "success",
+        "account_id": account_id,
+        "location_id": location_id,
+        "api_base_url": api_base_url,
+        "location_shards": location_shards,
+        "user_shards": user_shards,
+        "shard_count": len(location_shards) + len(user_shards),
+    }
+
+
 async def _handle_location_shard(body: dict) -> dict:
     """mode=location_shard — fetch a fixed page range for one location resource."""
     from crm_sync._base import location_sync
@@ -257,6 +299,15 @@ async def _handle_location_shard(body: dict) -> dict:
     page_end = int(body["page_end"])
 
     mod = importlib.import_module(f"crm_sync.{resource}")
+    # A resource may declare a side output (e.g. customers → customer_tags assignments)
+    # that is derived from the same fetch — attach it if present.
+    side_kwargs = {}
+    if getattr(mod, "SIDE_MAP_FN", None) is not None:
+        side_kwargs = {
+            "side_map_fn": mod.SIDE_MAP_FN,
+            "side_s3_prefix": mod.side_s3_prefix(),
+            "side_entity_type": getattr(mod, "SIDE_ENTITY_TYPE", "side"),
+        }
     processed, expected = await location_sync.run(
         location_id, account_id, api_base_url,
         fetch_page_fn=mod.fetch_page,
@@ -264,9 +315,22 @@ async def _handle_location_shard(body: dict) -> dict:
         resource=resource,
         page_start=page_start,
         page_end=page_end,
+        **side_kwargs,
     )
     return {"status": "success", "resource": resource, "page_start": page_start,
             "page_end": page_end, "records": processed}
+
+
+async def _handle_tenant_shard(body: dict) -> dict:
+    """mode=tenant_shard — tiny tenant-wide lookup (user_tags); one shard, fetch all pages."""
+    resource = body["resource"]
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+
+    mod = importlib.import_module(f"crm_sync.{resource}")
+    processed, expected = await mod.process_tenant(account_id, location_id, api_base_url)
+    return {"status": "success", "resource": resource, "records": processed}
 
 
 async def _handle_user_shard(body: dict) -> dict:
@@ -320,9 +384,11 @@ async def _handle_user_batch_shard(body: dict) -> dict:
 
 _MODE_HANDLERS = {
     "plan": _handle_plan,
+    "backfill_plan": _handle_backfill_plan,
     "location_shard": _handle_location_shard,
     "user_shard": _handle_user_shard,
     "user_batch_shard": _handle_user_batch_shard,
+    "tenant_shard": _handle_tenant_shard,
 }
 
 

@@ -6,6 +6,9 @@ DROP TABLE IF EXISTS "mt_class_sessions_details_dlk";
 DROP TABLE IF EXISTS "mt_membership_instances_details_dlk";
 DROP TABLE IF EXISTS "mt_reservations_details_dlk";
 DROP TABLE IF EXISTS "mt_orders_details_dlk";
+DROP TABLE IF EXISTS "mt_user_notes_details_dlk";
+DROP TABLE IF EXISTS "mt_user_tags_details_dlk";
+DROP TABLE IF EXISTS "mt_customer_tags_details_dlk";
 
 CREATE TABLE "mt_membership_transactions_details_dlk" (
   id integer,
@@ -206,4 +209,55 @@ CREATE TABLE "mt_membership_instances_details_dlk" (
   deleted_at timestamp(3) without time zone,
   deleted_by integer,
   account_id integer
+);
+
+CREATE TABLE "mt_user_notes_details_dlk" (
+  id integer,
+  account_id integer,
+  customer_id character varying(255),
+  customer_ref_id integer,
+  note_id character varying(64),
+  note text,
+  note_datetime timestamp(3) without time zone,
+  is_pinned boolean,
+  author_id character varying(255),
+  location integer,
+  created_at timestamp(3) without time zone,
+  created_by integer,
+  updated_at timestamp(3) without time zone,
+  updated_by integer,
+  deleted_at timestamp(3) without time zone,
+  deleted_by integer
+);
+
+CREATE TABLE "mt_user_tags_details_dlk" (
+  id integer,
+  tag_id character varying(64),
+  account_id integer,
+  location integer,
+  name character varying(255),
+  slug character varying(255),
+  user_tag_type character varying(64),
+  description text,
+  tag_type character varying(64),
+  weight integer,
+  created_at timestamp(3) without time zone,
+  created_by integer,
+  updated_at timestamp(3) without time zone,
+  updated_by integer,
+  deleted_at timestamp(3) without time zone,
+  deleted_by integer
+);
+
+CREATE TABLE "mt_customer_tags_details_dlk" (
+  id integer,
+  account_id integer,
+  customer_id character varying(255),
+  customer_ref_id integer,
+  tag_id character varying(64),
+  custom_tag_id integer,
+  default_tag_id integer,
+  location integer,
+  created_at timestamp(3) without time zone,
+  created_by integer
 );

@@ -10,6 +10,13 @@ logger = logging.getLogger(__name__)
 _RESOURCE = "customers"
 
 
+def _tags_csv(u):
+    """CSV of the customer's MT tag ids from relationships.tags (raw; exploded in Stage 3)."""
+    tag_data = ((u.get("relationships", {}) or {}).get("tags", {}) or {}).get("data", []) or []
+    ids = [str(t.get("id")) for t in tag_data if t.get("id") is not None]
+    return ",".join(ids) if ids else None
+
+
 async def fetch_page(location_id: str, page: int, account_id: str, api_base_url: str):
     page_size = getattr(settings, "PAGE_SIZE", 500)
     params = {"home_location": location_id, "page": page, "page_size": page_size}
@@ -55,6 +62,7 @@ async def fetch_page(location_id: str, page: int, account_id: str, api_base_url:
             "date_joined": attrs.get("date_joined"),
             "is_opted_in_to_sms": attrs.get("is_opted_in_to_sms"),
             "completed_class_count": attrs.get("completed_class_count"),
+            "tags": _tags_csv(u),
             "state_id": None,
             "created_at": None,
             "created_by": None,
@@ -72,6 +80,44 @@ async def fetch_page(location_id: str, page: int, account_id: str, api_base_url:
     return valid, resp
 
 
+def _extract_tag_assignments(resp, account_id, location_id):
+    """
+    side_map_fn for location_sync — derive customer→tag links from the customers response.
+    Emits one CustomerTagAssignment row per (customer, tag) in relationships.tags, so a
+    customer with N tags produces N rows. Refs (customer_ref_id, custom/default tag id)
+    are resolved in Stage 3.
+    """
+    from schemas.revi_schema import CustomerTagAssignment
+    rows = []
+    for u in resp.get("data", []):
+        cust_id = str(u["id"]) if u.get("id") is not None else None
+        tag_data = ((u.get("relationships", {}) or {}).get("tags", {}) or {}).get("data", []) or []
+        for t in tag_data:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            try:
+                rows.append(CustomerTagAssignment(
+                    account_id=account_id,
+                    customer_id=cust_id,
+                    tag_id=str(tid),
+                    location=int(location_id) if location_id is not None else None,
+                ).model_dump())
+            except Exception as e:
+                logger.warning(f"[customers.tags] skip customer={cust_id} tag={tid}: {e}")
+    return rows
+
+
+# Hooks the Stage-1 dispatch reads to attach the tag-assignment side output to the
+# customers shard (see handlers/crm_to_s3.py _handle_location_shard).
+SIDE_MAP_FN = _extract_tag_assignments
+SIDE_ENTITY_TYPE = "customer_tags"
+
+
+def side_s3_prefix():
+    return settings.S3_PREFIXES.get("customer_tags", "mariana-tek/customer_tags-details")
+
+
 async def process_for_location(
     location_id: str, account_id: str, api_base_url: str, save_to_s3: bool = True
 ) -> tuple[int, int, list]:
@@ -85,6 +131,9 @@ async def process_for_location(
             fetch_page_fn=fetch_page,
             s3_prefix=settings.S3_PREFIXES["customers"],
             resource=_RESOURCE,
+            side_map_fn=SIDE_MAP_FN,
+            side_s3_prefix=side_s3_prefix(),
+            side_entity_type=SIDE_ENTITY_TYPE,
         )
         return processed, expected, []
 

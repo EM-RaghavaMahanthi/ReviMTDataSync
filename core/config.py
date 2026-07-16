@@ -45,7 +45,11 @@ class Settings(BaseSettings):
     CREDIT_TRANSACTIONS_S3_PREFIX: str = "credit-transactions-details"
     MEMBERSHIP_INSTANCES_S3_PREFIX: str = "membership-instances-details"
     MEMBERSHIP_TRANSACTIONS_S3_PREFIX: str = "membership-transactions-details"
-    
+    # Tags & notes (new)
+    USER_NOTES_S3_PREFIX: str = "mariana-tek/user_notes-details"
+    USER_TAGS_S3_PREFIX: str = "mariana-tek/user_tags-details"
+    CUSTOMER_TAGS_S3_PREFIX: str = "mariana-tek/customer_tags-details"
+
     # Optional JSON string field for all prefixes at once
     s3_prefixes: Optional[str] = None
     
@@ -69,6 +73,9 @@ class Settings(BaseSettings):
             "credit_transactions": self.CREDIT_TRANSACTIONS_S3_PREFIX,
             "membership_instances": self.MEMBERSHIP_INSTANCES_S3_PREFIX,
             "membership_transactions": self.MEMBERSHIP_TRANSACTIONS_S3_PREFIX,
+            "user_notes": self.USER_NOTES_S3_PREFIX,
+            "user_tags": self.USER_TAGS_S3_PREFIX,
+            "customer_tags": self.CUSTOMER_TAGS_S3_PREFIX,
         }
 
     class Config:

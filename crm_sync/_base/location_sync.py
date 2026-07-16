@@ -40,11 +40,19 @@ async def run(
     concurrency_limit: int = None,
     page_start: int = 1,
     page_end: int = None,
+    side_map_fn=None,
+    side_s3_prefix: str = None,
+    side_entity_type: str = "side",
 ) -> tuple[int, int]:
     """
     Paginate through pages for entity_id, batch-write to S3, retry failures via DLQ.
     Returns (total_processed, total_expected). In sharded mode total_expected is 0
     (unknown — no probe).
+
+    Optional side output: if side_map_fn is given, each page's RAW response is passed to
+    side_map_fn(resp, account_id, entity_id) -> list[dict]; those rows are batched and
+    written to side_s3_prefix (entity_type=side_entity_type). Used to derive a second
+    dataset (e.g. customer tag assignments) from the same fetch — no extra API call.
     """
     start_time = time.time()
     tag = resource.upper()
@@ -63,6 +71,10 @@ async def run(
     total_records = 0
     failed_pages: list = []
 
+    side_batch: list = []
+    side_num = page_start
+    side_total = 0
+
     async def flush():
         nonlocal batch_data, batch_num, total_processed
         if not batch_data:
@@ -77,6 +89,28 @@ async def run(
         batch_num += 1
         batch_data = []
 
+    async def flush_side():
+        nonlocal side_batch, side_num, side_total
+        if not side_batch:
+            return
+        if save_to_s3 and side_s3_prefix:
+            await write_parquet_to_s3(
+                side_batch, entity_id, side_num, account_id,
+                s3_prefix=side_s3_prefix, entity_type=side_entity_type,
+            )
+            logger.info(f"[{tag}] side S3 batch {side_num}: {len(side_batch)} rows → {side_entity_type}")
+        side_total += len(side_batch)
+        side_num += 1
+        side_batch = []
+
+    def extract_side(resp):
+        if side_map_fn is None or not resp:
+            return
+        try:
+            side_batch.extend(side_map_fn(resp, account_id, entity_id))
+        except Exception as e:
+            logger.error(f"[{tag}] side_map_fn failed on a page: {e}")
+
     if not sharded:
         # Probe page 1 to discover total_pages.
         try:
@@ -89,6 +123,7 @@ async def run(
         total_records = pagination.get("count", len(first_data))
         logger.info(f"[{tag}] entity={entity_id}: {total_records} records across {page_end} pages")
         batch_data.extend(first_data)
+        extract_side(first_resp)
         if len(batch_data) >= parquet_batch_size:
             await flush()
         concurrent_pages = list(range(2, page_end + 1))
@@ -103,36 +138,40 @@ async def run(
     async def fetch_page(page):
         async with semaphore:
             try:
-                data, _ = await fetch_page_fn(entity_id, page, account_id, api_base_url)
-                return data, page, None
+                data, resp = await fetch_page_fn(entity_id, page, account_id, api_base_url)
+                return data, resp, page, None
             except aiohttp.ClientResponseError as e:
                 # 403/404 on a paginated fetch = API over-reported total pages; this
                 # page has no data. (MarianaTek returns 403 for out-of-range pages.)
                 if e.status in (403, 404):
                     logger.info(f"[{tag}] entity={entity_id} page={page}: HTTP {e.status} — past last page, skipping")
-                    return [], page, None
+                    return [], None, page, None
                 logger.error(f"[{tag}] entity={entity_id} page={page} failed: {e}")
                 failed_pages.append({
                     "entity_id": entity_id, "page": page,
                     "error": str(e), "timestamp": time.time(), "extra": {},
                 })
-                return [], page, e
+                return [], None, page, e
             except Exception as e:
                 logger.error(f"[{tag}] entity={entity_id} page={page} failed: {e}")
                 failed_pages.append({
                     "entity_id": entity_id, "page": page,
                     "error": str(e), "timestamp": time.time(), "extra": {},
                 })
-                return [], page, e
+                return [], None, page, e
 
     if concurrent_pages:
         results = await asyncio.gather(*[fetch_page(p) for p in concurrent_pages])
-        for data, _, _ in results:
+        for data, resp, _, _ in results:
             batch_data.extend(data)
+            extract_side(resp)
             if len(batch_data) >= parquet_batch_size:
                 await flush()
+            if len(side_batch) >= parquet_batch_size:
+                await flush_side()
 
     await flush()
+    await flush_side()
 
     # DLQ retry for any failed pages
     final_failed_count = 0
@@ -150,9 +189,10 @@ async def run(
             await flush()
 
     elapsed = time.time() - start_time
+    side_note = f", side_rows={side_total}" if side_map_fn else ""
     logger.info(
         f"[{tag}] DONE entity={entity_id}: processed={total_processed}, "
-        f"expected={total_records or 'unknown'}, elapsed={elapsed:.2f}s, pages={page_start}-{page_end}"
+        f"expected={total_records or 'unknown'}, elapsed={elapsed:.2f}s, pages={page_start}-{page_end}{side_note}"
     )
 
     if final_failed_count > 0:
