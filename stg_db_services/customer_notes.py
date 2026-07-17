@@ -4,6 +4,10 @@ from stg_db_services._base.dedup import drop_staging_duplicates
 
 logger = logging.getLogger(__name__)
 
+# TEMP: writing to customer_notes_temp instead of customer_notes to validate writes are
+# correct before pointing at the real table. Flip this back to "customer_notes" once verified.
+_TABLE = "customer_notes_temp"
+
 
 async def step_1_count_staging_total(account_id: str, engine):
     """Step 1: Count total entries in staging table (account-scoped — no location filter)."""
@@ -27,9 +31,9 @@ async def step_2_count_existing_in_main_table(account_id: str, engine):
     logger.info(f"[STEP 2] Counting entries already in main customer_notes table")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(*) as count
-                FROM public.customer_notes
+                FROM public.{_TABLE}
                 WHERE account_id = :account_id
             """), {"account_id": account_id})
             existing_count = result.fetchone()[0]
@@ -45,12 +49,12 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, engi
     logger.info(f"[STEP 3] Counting staging records that already exist in main table")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(*) as count
                 FROM mt_user_notes_details_dlk stg
                 WHERE stg.account_id = :account_id
                   AND EXISTS (
-                    SELECT 1 FROM customer_notes cn
+                    SELECT 1 FROM {_TABLE} cn
                     WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
                       AND cn.note_id = stg.note_id
                   )
@@ -68,13 +72,13 @@ async def step_4_count_records_to_insert(account_id: str, engine):
     logger.info(f"[STEP 4] Counting staging records ready for insertion")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(*) as count
                 FROM mt_user_notes_details_dlk stg
                 INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
                 WHERE stg.account_id = :account_id
                   AND NOT EXISTS (
-                    SELECT 1 FROM customer_notes cn
+                    SELECT 1 FROM {_TABLE} cn
                     WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
                       AND cn.note_id = stg.note_id
                   )
@@ -98,8 +102,8 @@ async def step_5_insert_new_records(account_id: str, engine):
     """
     logger.info(f"[STEP 5] Inserting new records into main customer_notes table")
     try:
-        insert_sql = text("""
-            INSERT INTO public.customer_notes (
+        insert_sql = text(f"""
+            INSERT INTO public.{_TABLE} (
               account_id, customer_id, customer_ref_id, note_id, note, note_datetime,
               created_at, created_by, updated_at, updated_by, deleted_at, deleted_by
             )
@@ -110,7 +114,7 @@ async def step_5_insert_new_records(account_id: str, engine):
             INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
             WHERE stg.account_id = :account_id
               AND NOT EXISTS (
-                SELECT 1 FROM customer_notes cn
+                SELECT 1 FROM {_TABLE} cn
                 WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
                   AND cn.note_id = stg.note_id
               )

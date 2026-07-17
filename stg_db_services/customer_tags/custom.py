@@ -13,6 +13,10 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
+# TEMP: writing to customer_tags_custom_temp instead of customer_tags_custom to validate
+# writes are correct before pointing at the real table. Flip back once verified.
+_TABLE = "customer_tags_custom_temp"
+
 
 async def step_1_count_staging_total(account_id: str, engine):
     """Step 1: Count manual-tag assignment rows in staging for this account."""
@@ -39,8 +43,8 @@ async def step_2_count_existing_in_main_table(account_id: str, engine):
     logger.info(f"[STEP 2] Counting entries already in main customer_tags_custom table")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
-                SELECT COUNT(*) as count FROM customer_tags_custom WHERE account_id = :account_id
+            result = conn.execute(text(f"""
+                SELECT COUNT(*) as count FROM {_TABLE} WHERE account_id = :account_id
             """), {"account_id": account_id})
             existing_count = result.fetchone()[0]
         logger.info(f"[STEP 2] SUCCESS: Entries already in main table: {existing_count}")
@@ -55,14 +59,14 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, engi
     logger.info(f"[STEP 3] Counting staging records that already exist in main table")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(*) as count
                 FROM mt_customer_tags_details_dlk stg
                 INNER JOIN mt_user_tags_details_dlk ut
                   ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
                 WHERE stg.account_id = :account_id AND ut.tag_type = 'manual'
                   AND EXISTS (
-                    SELECT 1 FROM customer_tags_custom cust
+                    SELECT 1 FROM {_TABLE} cust
                     WHERE cust.account_id = stg.account_id AND cust.customer_id = stg.customer_id
                       AND cust.name = ut.name
                   )
@@ -80,14 +84,14 @@ async def step_4_count_records_to_insert(account_id: str, engine):
     logger.info(f"[STEP 4] Counting staging records ready for insertion")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(DISTINCT (stg.account_id, stg.customer_id, ut.name)) as count
                 FROM mt_customer_tags_details_dlk stg
                 INNER JOIN mt_user_tags_details_dlk ut
                   ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
                 WHERE stg.account_id = :account_id AND ut.tag_type = 'manual'
                   AND NOT EXISTS (
-                    SELECT 1 FROM customer_tags_custom cust
+                    SELECT 1 FROM {_TABLE} cust
                     WHERE cust.account_id = stg.account_id AND cust.customer_id = stg.customer_id
                       AND cust.name = ut.name
                   )
@@ -104,8 +108,8 @@ async def step_5_insert_new_records(account_id: str, engine):
     """Step 5: Insert new customer_tags_custom rows. customer_ref_id via the standard customers join."""
     logger.info(f"[STEP 5] Inserting new records into main customer_tags_custom table")
     try:
-        insert_sql = text("""
-            INSERT INTO public.customer_tags_custom (
+        insert_sql = text(f"""
+            INSERT INTO public.{_TABLE} (
               account_id, customer_ref_id, customer_id, name, created_at, created_by
             )
             SELECT DISTINCT
@@ -117,7 +121,7 @@ async def step_5_insert_new_records(account_id: str, engine):
             INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
             WHERE stg.account_id = :account_id AND ut.tag_type = 'manual'
               AND NOT EXISTS (
-                SELECT 1 FROM customer_tags_custom cust
+                SELECT 1 FROM {_TABLE} cust
                 WHERE cust.account_id = stg.account_id AND cust.customer_id = stg.customer_id
                   AND cust.name = ut.name
               )

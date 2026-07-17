@@ -14,19 +14,24 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
+# TEMP: writing to the _temp versions of both tables to validate writes are correct before
+# pointing at the real ones. Flip both back once verified (must match custom.py's _TABLE).
+_CUSTOM_TABLE = "customer_tags_custom_temp"
+_ASSIGNMENTS_TABLE = "customer_tag_assignments_temp"
+
 
 async def step_count_ready(account_id: str, engine):
     with engine.begin() as conn:
-        result = conn.execute(text("""
+        result = conn.execute(text(f"""
             SELECT COUNT(*) as count
             FROM mt_customer_tags_details_dlk stg
             INNER JOIN mt_user_tags_details_dlk ut
               ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
-            INNER JOIN customer_tags_custom cust
+            INNER JOIN {_CUSTOM_TABLE} cust
               ON cust.account_id = stg.account_id AND cust.customer_id = stg.customer_id AND cust.name = ut.name
             WHERE stg.account_id = :account_id AND ut.tag_type = 'manual'
               AND NOT EXISTS (
-                SELECT 1 FROM customer_tag_assignments a
+                SELECT 1 FROM {_ASSIGNMENTS_TABLE} a
                 WHERE a.account_id = stg.account_id AND a.customer_id = stg.customer_id
                   AND a.custom_tag_id = cust.id
               )
@@ -35,8 +40,8 @@ async def step_count_ready(account_id: str, engine):
 
 
 async def step_insert(account_id: str, engine):
-    insert_sql = text("""
-        INSERT INTO public.customer_tag_assignments (
+    insert_sql = text(f"""
+        INSERT INTO public.{_ASSIGNMENTS_TABLE} (
           account_id, customer_ref_id, customer_id, custom_tag_id, default_tag_id, created_at, created_by
         )
         SELECT DISTINCT
@@ -45,11 +50,11 @@ async def step_insert(account_id: str, engine):
         INNER JOIN mt_user_tags_details_dlk ut
           ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
         INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
-        INNER JOIN customer_tags_custom cust
+        INNER JOIN {_CUSTOM_TABLE} cust
           ON cust.account_id = stg.account_id AND cust.customer_id = stg.customer_id AND cust.name = ut.name
         WHERE stg.account_id = :account_id AND ut.tag_type = 'manual'
           AND NOT EXISTS (
-            SELECT 1 FROM customer_tag_assignments a
+            SELECT 1 FROM {_ASSIGNMENTS_TABLE} a
             WHERE a.account_id = stg.account_id AND a.customer_id = stg.customer_id
               AND a.custom_tag_id = cust.id
           )
