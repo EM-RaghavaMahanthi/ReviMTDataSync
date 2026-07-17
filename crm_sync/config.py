@@ -39,12 +39,13 @@ RESOURCE_CONFIG: dict = {
     "class_sessions": {"endpoint": "/class_sessions", "fetch_type": "location", "probe_param": "location"},
     "reservations":   {"endpoint": "/reservations",   "fetch_type": "location", "probe_param": "location"},
 
-    # Small table — download the whole tenant unfiltered, then filter by customer_id.
-    "membership_instances": {"endpoint": "/membership_instances", "fetch_type": "user", "probe_param": "location"},
-
-    # Batched by repeated &user= (100 ids/call); one shard per resource.
-    "credit_transactions":     {"endpoint": "/credit_transactions",     "fetch_type": "user_batch", "batch_size": 100},
-    "membership_transactions": {"endpoint": "/membership_transactions", "fetch_type": "user_batch", "batch_size": 100},
+    # Download the whole tenant unfiltered, then filter by customer_id. credit_transactions
+    # and membership_transactions used to be "user_batch" (100 ids/call via repeated &user=),
+    # but that started returning no records at all once a batch's query string got large
+    # enough — switched to the same unfiltered+filter approach as membership_instances.
+    "membership_instances":    {"endpoint": "/membership_instances",    "fetch_type": "user", "probe_param": "location"},
+    "credit_transactions":     {"endpoint": "/credit_transactions",     "fetch_type": "user", "probe_param": "location"},
+    "membership_transactions": {"endpoint": "/membership_transactions", "fetch_type": "user", "probe_param": "location"},
 
     # Notes: whole-tenant download (NO location filter), filtered by customer_id client-side.
     "user_notes": {"endpoint": "/user_notes", "fetch_type": "user", "probe_param": None},

@@ -1,6 +1,6 @@
 """
 event_type = "backfill_notes_and_tags" — runs Stage 3 (staging -> main RDS) for ONLY
-customer_notes and customer_tags (customer_tags_custom + customer_tag_assignments),
+customer_notes and customer_tags (customer_tags_default + customer_tag_assignments),
 without running the other 9 PROCESSING_ORDER steps in handlers/stg_to_db.py.
 
 Staging (mt_user_notes_details_dlk, mt_user_tags_details_dlk, mt_customer_tags_details_dlk)

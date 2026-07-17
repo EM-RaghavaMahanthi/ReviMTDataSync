@@ -1,12 +1,10 @@
 """
-Orchestrates customer_tags_custom -> customer_tag_assignments.
-
-customer_tags_default is NOT built here — those rows are seeded during account onboarding,
-not by this sync (default_tag_id stays NULL on everything we insert).
+Orchestrates customer_tags_default -> customer_tag_assignments, in that order (assignments
+resolves default_tag_id via customer_tags_default, so it must run first).
 """
 
 import logging
-from stg_db_services.customer_tags.custom import process_customer_tags_custom
+from stg_db_services.customer_tags.default import process_customer_tags_default
 from stg_db_services.customer_tags.assignments import process_customer_tag_assignments
 
 logger = logging.getLogger(__name__)
@@ -14,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 async def process_customer_tags(account_id: str, location_id: int, engine):
     """
-    Main orchestrator for customer_tags processing (manual tags -> assignments).
+    Main orchestrator for customer_tags processing (tag definitions -> assignments).
     location_id is accepted for PROCESSING_ORDER's uniform call signature but unused — neither
     sub-step is location-scoped.
     """
@@ -22,16 +20,16 @@ async def process_customer_tags(account_id: str, location_id: int, engine):
 
     results = {}
     try:
-        logger.info(f"[process_customer_tags] Step A: customer_tags_custom (manual tags)")
+        logger.info(f"[process_customer_tags] Step A: customer_tags_default (tag definitions)")
         try:
-            result_custom = await process_customer_tags_custom(account_id, engine)
-            results["customer_tags_custom"] = result_custom
-            logger.info(f"[process_customer_tags] Step A SUCCESS: {result_custom['inserted_records']} inserted")
+            result_default = await process_customer_tags_default(account_id, engine)
+            results["customer_tags_default"] = result_default
+            logger.info(f"[process_customer_tags] Step A SUCCESS: {result_default['inserted_records']} inserted")
         except Exception as e:
             logger.error(f"[process_customer_tags] Step A FAILED: {e}")
             raise
 
-        logger.info(f"[process_customer_tags] Step B: customer_tag_assignments (manual only)")
+        logger.info(f"[process_customer_tags] Step B: customer_tag_assignments")
         try:
             result_assignments = await process_customer_tag_assignments(account_id, engine)
             results["customer_tag_assignments"] = result_assignments
@@ -46,7 +44,7 @@ async def process_customer_tags(account_id: str, location_id: int, engine):
 
         logger.info(
             f"[process_customer_tags] ORCHESTRATION COMPLETE for account_id={account_id}: "
-            f"custom={results['customer_tags_custom']['inserted_records']}, "
+            f"default={results['customer_tags_default']['inserted_records']}, "
             f"assignments={results['customer_tag_assignments']['inserted_records']}, "
             f"TOTAL={total_inserted}"
         )

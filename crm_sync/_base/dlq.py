@@ -24,13 +24,18 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# /tmp is the only writable path in Lambda's filesystem (everything else, including the
+# deployment package's cwd, is read-only) — a relative "data" dir here would crash every
+# DLQ retry with "Read-only file system".
+_DLQ_DIR = "/tmp/dlq"
+
 
 async def write_failed(entries: list, resource: str, entity_id: str, account_id: str) -> str | None:
     """Write failed page entries to a local DLQ JSON file. Returns file path or None."""
     if not entries:
         return None
-    os.makedirs("data", exist_ok=True)
-    path = f"data/failed_{resource}_{entity_id}_{account_id}.json"
+    os.makedirs(_DLQ_DIR, exist_ok=True)
+    path = f"{_DLQ_DIR}/failed_{resource}_{entity_id}_{account_id}.json"
     with open(path, "w") as f:
         for entry in entries:
             f.write(json.dumps(entry) + "\n")

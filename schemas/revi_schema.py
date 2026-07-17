@@ -283,25 +283,10 @@ class CustomerTagAssignment(BaseModel):
     customer_ref_id: Optional[int] = None   # resolved in Stage 3
     tag_id: Optional[str] = None            # relationships.tags[].id (MT user_tags id) — source
     tenant_name: Optional[str] = None       # subdomain of crm_api_end_point — needed to resolve
-    #                                         default_tag_id via customer_tags_default(tenant_name, name)
-    custom_tag_id: Optional[int] = None     # resolved in Stage 3 (tag_type == "manual")
-    default_tag_id: Optional[int] = None    # resolved in Stage 3 (tag_type == "system")
+    #                                         default_tag_id via customer_tags_default(tenant_name, crm_tag_id)
+    custom_tag_id: Optional[int] = None     # always NULL — customer_tags_custom not populated by this sync
+    default_tag_id: Optional[int] = None    # resolved in Stage 3 for every tag, regardless of MT tag_type
     location: Optional[int] = None
-    created_at: Optional[datetime] = None
-    created_by: Optional[int] = None
-
-    class Config:
-        from_attributes = True
-
-
-class CustomerTagCustom(BaseModel):
-    """customer_tags_custom — populated in Stage 3 from manual tags + assignments; defined now."""
-    id: Optional[int] = None
-    account_id: Optional[int] = None
-    customer_id: Optional[str] = None       # MT user id
-    customer_ref_id: Optional[int] = None   # resolved in Stage 3
-    tag_id: Optional[str] = None            # source MT user_tags id (for the Stage 3 join)
-    name: Optional[str] = None              # tag name (from UserTag)
     created_at: Optional[datetime] = None
     created_by: Optional[int] = None
 

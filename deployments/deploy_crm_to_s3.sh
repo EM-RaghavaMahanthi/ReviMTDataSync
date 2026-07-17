@@ -17,7 +17,7 @@ SOURCE_DIRS=("core" "clients" "handlers" "crm_sync" "schemas" "utils")
 # MarianaTek rate-limit / sharding env vars (merged into the Lambda config below,
 # preserving all existing vars). Override any at deploy time, e.g.:
 #   USER_BATCHES_PER_SHARD=10 ./deployments/deploy_crm_to_s3.sh
-PAGE_SIZE="${PAGE_SIZE:-100}"                                 # MT hard-caps page_size at 100
+PAGE_SIZE="${PAGE_SIZE:-500}"                                 # MT confirmed page_size up to 500
 CRM_MAX_REQUESTS_PER_MIN="${CRM_MAX_REQUESTS_PER_MIN:-100}"   # token bucket = 50% of the 200/min ceiling
 PAGES_PER_SHARD="${PAGES_PER_SHARD:-200}"                     # pages per location/user page-range shard
 USER_BATCHES_PER_SHARD="${USER_BATCHES_PER_SHARD:-20}"        # 100-user batches per user_batch shard (~2 min/shard)

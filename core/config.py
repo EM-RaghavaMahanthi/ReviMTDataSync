@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     PARQUET_BATCH_SIZE: int = 1000
     S3_BUCKET: str
     CONCURRENCY_LIMIT: int = 16
-    PAGE_SIZE: int = 100  # MarianaTek hard-caps page_size at 100 on all endpoints
+    PAGE_SIZE: int = 500  # MarianaTek confirmed page_size up to 500 on all endpoints
 
     # Per-tenant request rate cap (50% of MarianaTek's 200 req/min ceiling — headroom
     # for the in-process token bucket in utils/api_client.py). Read there via os.environ.

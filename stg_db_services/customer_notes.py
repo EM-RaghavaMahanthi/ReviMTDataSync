@@ -4,9 +4,7 @@ from stg_db_services._base.dedup import drop_staging_duplicates
 
 logger = logging.getLogger(__name__)
 
-# TEMP: writing to customer_notes_temp instead of customer_notes to validate writes are
-# correct before pointing at the real table. Flip this back to "customer_notes" once verified.
-_TABLE = "customer_notes_temp"
+_TABLE = "customer_notes"
 
 
 async def step_1_count_staging_total(account_id: str, engine):
@@ -94,6 +92,31 @@ async def step_3b_count_missing_customers(account_id: str, engine):
         raise
 
 
+async def step_3c_count_null_notes(account_id: str, engine):
+    """
+    Step 3c: Count staging rows where note text is NULL (MarianaTek sent no `text`
+    attribute) — customer_notes.note is NOT NULL, so these are excluded by step_4/step_5's
+    filter rather than crashing the whole insert batch. Subtracted from the expected count.
+    """
+    logger.info(f"[STEP 3c] Counting staging rows with null note text")
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM mt_user_notes_details_dlk stg
+                WHERE stg.account_id = :account_id
+                  AND stg.note IS NULL
+            """), {"account_id": account_id})
+            null_count = result.fetchone()[0]
+        if null_count > 0:
+            logger.warning(f"[STEP 3c] {null_count} staging notes have null note text — will be skipped")
+        logger.info(f"[STEP 3c] SUCCESS: Records with null note: {null_count}")
+        return null_count
+    except Exception as e:
+        logger.error(f"[STEP 3c] ERROR: Failed to count null-note records: {e}")
+        raise
+
+
 async def step_4_count_records_to_insert(account_id: str, engine):
     """Step 4: Count staging records NOT in main table (ready to insert)."""
     logger.info(f"[STEP 4] Counting staging records ready for insertion")
@@ -104,6 +127,7 @@ async def step_4_count_records_to_insert(account_id: str, engine):
                 FROM mt_user_notes_details_dlk stg
                 INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
                 WHERE stg.account_id = :account_id
+                  AND stg.note IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM {_TABLE} cn
                     WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
@@ -136,10 +160,11 @@ async def step_5_insert_new_records(account_id: str, engine):
             )
             SELECT
               stg.account_id, stg.customer_id, c.id AS customer_ref_id, stg.note_id, stg.note, stg.note_datetime,
-              NOW() AS created_at, 1 AS created_by, NOW() AS updated_at, 1 AS updated_by, NULL, NULL
+              NOW() AS created_at, -1 AS created_by, NOW() AS updated_at, -1 AS updated_by, NULL, NULL
             FROM mt_user_notes_details_dlk stg
             INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
             WHERE stg.account_id = :account_id
+              AND stg.note IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM {_TABLE} cn
                 WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
@@ -170,6 +195,7 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
     existing_in_main = 0
     already_exist_in_main = 0
     missing_customer_records = 0
+    null_note_records = 0
     ready_to_insert = 0
     actual_inserted = 0
 
@@ -181,9 +207,10 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
         existing_in_main = await step_2_count_existing_in_main_table(account_id, engine)
         already_exist_in_main = await step_3_count_records_already_exist_in_main_table(account_id, engine)
         missing_customer_records = await step_3b_count_missing_customers(account_id, engine)
+        null_note_records = await step_3c_count_null_notes(account_id, engine)
         ready_to_insert = await step_4_count_records_to_insert(account_id, engine)
 
-        expected_ready = total_staging - already_exist_in_main - missing_customer_records
+        expected_ready = total_staging - already_exist_in_main - missing_customer_records - null_note_records
         logger.info(f"[process_customer_notes] Pre-insertion validation: expected={expected_ready}, actual={ready_to_insert}")
         if ready_to_insert != expected_ready:
             raise Exception(f"Count mismatch! Expected {expected_ready}, got {ready_to_insert}. Manual review required.")
@@ -197,7 +224,7 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
             f"[process_customer_notes] SUCCESS for account_id={account_id}: "
             f"duplicates_removed={duplicates_removed}, total_staging={total_staging}, "
             f"already_exist={already_exist_in_main}, missing_customer={missing_customer_records}, "
-            f"inserted={actual_inserted}"
+            f"null_note={null_note_records}, inserted={actual_inserted}"
         )
 
         return {
@@ -206,6 +233,7 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
             "existing_records": existing_in_main,
             "already_exist_records": already_exist_in_main,
             "missing_customer_records": missing_customer_records,
+            "null_note_records": null_note_records,
             "ready_to_insert": ready_to_insert,
             "inserted_records": actual_inserted,
         }
