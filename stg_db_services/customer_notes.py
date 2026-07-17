@@ -67,6 +67,33 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, engi
         raise
 
 
+async def step_3b_count_missing_customers(account_id: str, engine):
+    """
+    Step 3b: Count staging rows whose customer_id has no matching row in `customers` for
+    this account (removed/merged/never-synced customer) — these are legitimately excluded
+    by step_4/step_5's INNER JOIN, not a bug, so they must be subtracted from the expected
+    count. Same pattern as credit_transactions.py's step_3_count_transactions_with_missing_customers.
+    """
+    logger.info(f"[STEP 3b] Counting staging rows with no matching customer")
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM mt_user_notes_details_dlk stg
+                LEFT JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
+                WHERE stg.account_id = :account_id
+                  AND c.customer_id IS NULL
+            """), {"account_id": account_id})
+            missing_count = result.fetchone()[0]
+        if missing_count > 0:
+            logger.warning(f"[STEP 3b] {missing_count} staging notes reference a customer_id not found in customers")
+        logger.info(f"[STEP 3b] SUCCESS: Records with missing customer: {missing_count}")
+        return missing_count
+    except Exception as e:
+        logger.error(f"[STEP 3b] ERROR: Failed to count missing-customer records: {e}")
+        raise
+
+
 async def step_4_count_records_to_insert(account_id: str, engine):
     """Step 4: Count staging records NOT in main table (ready to insert)."""
     logger.info(f"[STEP 4] Counting staging records ready for insertion")
@@ -142,6 +169,7 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
     total_staging = 0
     existing_in_main = 0
     already_exist_in_main = 0
+    missing_customer_records = 0
     ready_to_insert = 0
     actual_inserted = 0
 
@@ -152,9 +180,10 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
         total_staging = await step_1_count_staging_total(account_id, engine)
         existing_in_main = await step_2_count_existing_in_main_table(account_id, engine)
         already_exist_in_main = await step_3_count_records_already_exist_in_main_table(account_id, engine)
+        missing_customer_records = await step_3b_count_missing_customers(account_id, engine)
         ready_to_insert = await step_4_count_records_to_insert(account_id, engine)
 
-        expected_ready = total_staging - already_exist_in_main
+        expected_ready = total_staging - already_exist_in_main - missing_customer_records
         logger.info(f"[process_customer_notes] Pre-insertion validation: expected={expected_ready}, actual={ready_to_insert}")
         if ready_to_insert != expected_ready:
             raise Exception(f"Count mismatch! Expected {expected_ready}, got {ready_to_insert}. Manual review required.")
@@ -167,7 +196,8 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
         logger.info(
             f"[process_customer_notes] SUCCESS for account_id={account_id}: "
             f"duplicates_removed={duplicates_removed}, total_staging={total_staging}, "
-            f"already_exist={already_exist_in_main}, inserted={actual_inserted}"
+            f"already_exist={already_exist_in_main}, missing_customer={missing_customer_records}, "
+            f"inserted={actual_inserted}"
         )
 
         return {
@@ -175,6 +205,7 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
             "total_records": total_staging,
             "existing_records": existing_in_main,
             "already_exist_records": already_exist_in_main,
+            "missing_customer_records": missing_customer_records,
             "ready_to_insert": ready_to_insert,
             "inserted_records": actual_inserted,
         }

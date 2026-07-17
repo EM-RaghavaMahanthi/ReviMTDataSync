@@ -45,7 +45,8 @@ async def step_insert(account_id: str, engine):
           account_id, customer_ref_id, customer_id, custom_tag_id, default_tag_id, created_at, created_by
         )
         SELECT DISTINCT
-          stg.account_id, c.id AS customer_ref_id, stg.customer_id, cust.id AS custom_tag_id, NULL, NOW(), 1
+          stg.account_id, c.id AS customer_ref_id, stg.customer_id, cust.id AS custom_tag_id,
+          NULL::integer AS default_tag_id, NOW(), 1
         FROM mt_customer_tags_details_dlk stg
         INNER JOIN mt_user_tags_details_dlk ut
           ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id

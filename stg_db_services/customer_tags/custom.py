@@ -79,6 +79,33 @@ async def step_3_count_records_already_exist_in_main_table(account_id: str, engi
         raise
 
 
+async def step_count_missing_customers(account_id: str, engine):
+    """
+    Count staging rows (manual tags) whose customer_id has no matching row in `customers`
+    for this account — legitimately excluded by step_4/step_5's INNER JOIN, reported here
+    for visibility (same pattern as credit_transactions.py / customer_notes.py).
+    """
+    logger.info(f"[STEP] Counting manual-tag rows with no matching customer")
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM mt_customer_tags_details_dlk stg
+                INNER JOIN mt_user_tags_details_dlk ut
+                  ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
+                LEFT JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
+                WHERE stg.account_id = :account_id AND ut.tag_type = 'manual'
+                  AND c.customer_id IS NULL
+            """), {"account_id": account_id})
+            missing_count = result.fetchone()[0]
+        if missing_count > 0:
+            logger.warning(f"[STEP] {missing_count} manual-tag rows reference a customer_id not found in customers")
+        return missing_count
+    except Exception as e:
+        logger.error(f"[STEP] ERROR: Failed to count missing-customer records: {e}")
+        raise
+
+
 async def step_4_count_records_to_insert(account_id: str, engine):
     """Step 4: Count staging rows ready to insert (distinct (account_id, customer_id, name), not already present)."""
     logger.info(f"[STEP 4] Counting staging records ready for insertion")
@@ -143,6 +170,7 @@ async def process_customer_tags_custom(account_id: str, engine):
     total_staging = 0
     existing_in_main = 0
     already_exist_in_main = 0
+    missing_customer_records = 0
     ready_to_insert = 0
     actual_inserted = 0
 
@@ -150,6 +178,7 @@ async def process_customer_tags_custom(account_id: str, engine):
         total_staging = await step_1_count_staging_total(account_id, engine)
         existing_in_main = await step_2_count_existing_in_main_table(account_id, engine)
         already_exist_in_main = await step_3_count_records_already_exist_in_main_table(account_id, engine)
+        missing_customer_records = await step_count_missing_customers(account_id, engine)
         ready_to_insert = await step_4_count_records_to_insert(account_id, engine)
 
         if ready_to_insert == 0:
@@ -159,7 +188,8 @@ async def process_customer_tags_custom(account_id: str, engine):
 
         logger.info(
             f"[process_customer_tags_custom] SUCCESS for account_id={account_id}: "
-            f"total_staging={total_staging}, already_exist={already_exist_in_main}, inserted={actual_inserted}"
+            f"total_staging={total_staging}, already_exist={already_exist_in_main}, "
+            f"missing_customer={missing_customer_records}, inserted={actual_inserted}"
         )
 
         return {
@@ -167,6 +197,7 @@ async def process_customer_tags_custom(account_id: str, engine):
             "total_records": total_staging,
             "existing_records": existing_in_main,
             "already_exist_records": already_exist_in_main,
+            "missing_customer_records": missing_customer_records,
             "ready_to_insert": ready_to_insert,
             "inserted_records": actual_inserted,
         }
