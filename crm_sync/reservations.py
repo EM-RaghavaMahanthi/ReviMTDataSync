@@ -34,7 +34,9 @@ async def fetch_page(location_id: str, page: int, account_id: str, api_base_url:
             "check_in_date": attrs.get("check_in_date"),
             "creation_date": attrs.get("creation_date"),
             "status": attrs.get("status"),
-            "guest": attrs.get("reserved_for_guest", False),
+            # A reservation is a guest booking iff MT gave it a guest_email. .strip() so a
+            # blank-but-not-empty value (" ") counts as absent, unlike a bare truthiness check.
+            "guest": bool((attrs.get("guest_email") or "").strip()),
             "reservation_type": attrs.get("reservation_type"),
             "first_timer": attrs.get("first_timer", False),
             "location": location_id,

@@ -199,7 +199,7 @@ def lambda_handler(event, context=None):
     if not api_base_url:
         return {"status": "error", "error": "api_base_url is required"}
 
-    engine = create_engine(settings.PROD_DATABASE_URL)
+    engine = create_engine(settings.DATABASE_URL)
     start  = time.time()
 
     result = {

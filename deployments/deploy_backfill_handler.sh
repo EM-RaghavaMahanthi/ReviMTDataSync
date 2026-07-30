@@ -19,6 +19,8 @@
 # Invoke (event_type selects the job; account_id is the current jobs' only input):
 #   aws lambda invoke --function-name revi-backfill \
 #     --payload '{"event_type":"backfill_notes_and_tags","account_id":4809}' out.json
+#   aws lambda invoke --function-name revi-backfill \
+#     --payload '{"event_type":"refresh_recent_notes","account_id":4809}' out.json
 
 set -euo pipefail
 
@@ -26,9 +28,11 @@ LAMBDA_NAME="${LAMBDA_NAME:-revi-backfill}"
 AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
 ZIP_NAME="backfill_handler_deploy.zip"
 BUILD_DIR="backfill_handler_build"
-# Stage-3-only: no crm_sync/db_services/clients/schemas — stg_db_services has none of those
-# dependencies (pure SQLAlchemy text() queries against already-staged data).
-SOURCE_DIRS=("core" "handlers" "stg_db_services")
+# backfill_notes_and_tags is Stage-3-only (pure SQLAlchemy, no CRM calls). refresh_recent_notes
+# calls the live MarianaTek API via utils.api_client (rate-limited/retried, same as Stage 1)
+# and reuses crm_sync.user_notes's row mapper (pulls in schemas.revi_schema) - so crm_sync,
+# utils, and schemas need to be bundled too, even though the other job doesn't use them.
+SOURCE_DIRS=("core" "handlers" "stg_db_services" "crm_sync" "utils" "schemas")
 
 # ── First-create-only config — reused from revi-data-sync-stg-to-db (same DB/VPC access
 # needs; only used if the function doesn't exist yet). Lighter memory/timeout than that
@@ -65,6 +69,21 @@ if [ -z "${DATABASE_URL:-}" ] && [ -f ".env" ]; then
 fi
 [ -n "${DATABASE_URL:-}" ] || error "DATABASE_URL not set and not found in .env — set it explicitly."
 
+# API_KEY is only needed by the refresh_recent_notes job (calls MarianaTek directly, same
+# bearer token used everywhere else) — not by backfill_notes_and_tags. Best-effort default
+# from .env; not fatal if missing, since not every job needs it.
+if [ -z "${API_KEY:-}" ] && [ -f ".env" ]; then
+    API_KEY="$(grep -E '^API_KEY\s*=' .env | head -1 | sed -E 's/^API_KEY[[:space:]]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+fi
+[ -n "${API_KEY:-}" ] || info "API_KEY not set and not found in .env — refresh_recent_notes will fail until it's added."
+
+# refresh_recent_notes's lookback window - always set explicitly as a Lambda env var (rather
+# than relying on the code's own default) so it's visible/adjustable straight from the Lambda
+# console without a redeploy. 24h for now (per-request, temporary for the first run - drop
+# back down after that). Override at deploy time:
+#   NOTES_WINDOW_HOURS=6 ./deployments/deploy_backfill_handler.sh
+NOTES_WINDOW_HOURS="${NOTES_WINDOW_HOURS:-24}"
+
 info "Cleaning old artifacts..."
 rm -rf "$BUILD_DIR" "$ZIP_NAME"
 mkdir -p "$BUILD_DIR"
@@ -90,7 +109,13 @@ aws lambda get-function --function-name "$LAMBDA_NAME" > /dev/null 2>&1 || FUNCT
 
 if [ "$FUNCTION_EXISTS" = false ]; then
     info "$LAMBDA_NAME does not exist — creating it (role/VPC/layers copied from revi-data-sync-stg-to-db)..."
-    ENV_JSON="$(jq -nc --arg db "$DATABASE_URL" '{Variables: {DATABASE_URL: $db}}')"
+    ENV_JSON="$(jq -nc \
+        --arg db "$DATABASE_URL" \
+        --arg key "$API_KEY" \
+        --arg win "$NOTES_WINDOW_HOURS" \
+        '{Variables: ({DATABASE_URL: $db}
+            + (if $key != "" then {API_KEY: $key} else {} end)
+            + (if $win != "" then {NOTES_WINDOW_HOURS: $win} else {} end))}')"
 
     aws lambda create-function \
         --function-name "$LAMBDA_NAME" \
@@ -136,7 +161,11 @@ fi
 
 ENV_JSON="$(echo "$CURRENT_ENV" | jq -c \
     --arg db "$DATABASE_URL" \
-    '{Variables: (. + {DATABASE_URL: $db})}')"
+    --arg key "$API_KEY" \
+    --arg win "$NOTES_WINDOW_HOURS" \
+    '{Variables: (. + {DATABASE_URL: $db}
+        + (if $key != "" then {API_KEY: $key} else {} end)
+        + (if $win != "" then {NOTES_WINDOW_HOURS: $win} else {} end))}')"
 
 info "Setting handler + environment..."
 aws lambda update-function-configuration \
@@ -148,6 +177,6 @@ aws lambda update-function-configuration \
 
 info "Waiting for configuration update to complete..."
 aws lambda wait function-updated --function-name "$LAMBDA_NAME" \
-    && success "Done — $LAMBDA_NAME updated (handler + DATABASE_URL)."
+    && success "Done — $LAMBDA_NAME updated (handler + DATABASE_URL + API_KEY + NOTES_WINDOW_HOURS=$NOTES_WINDOW_HOURS)."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"

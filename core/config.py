@@ -7,13 +7,12 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     API_BATCH_SIZE: int = 1000
 
-    NUM_THREADS: int = 8  
+    NUM_THREADS: int = 8
     DATABASE_URL: str
-    PROD_DATABASE_URL: str
     API_KEY: str = ""  # Made optional with default empty string
     API_BASE_URL: str = "https://revelmethod.marianatek.com/api"  # Added field
     PARQUET_BATCH_SIZE: int = 1000
-    S3_BUCKET: str
+    S3_BUCKET: str = ""  # optional - only Lambdas that actually write to S3 need this set
     CONCURRENCY_LIMIT: int = 16
     PAGE_SIZE: int = 500  # MarianaTek confirmed page_size up to 500 on all endpoints
 

@@ -241,3 +241,33 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
     except Exception as e:
         logger.error(f"[process_customer_notes] ERROR: Failed processing for account_id={account_id}: {e}")
         raise
+
+
+async def update_changed_notes(account_id: str, engine) -> dict:
+    """
+    Update customer_notes rows whose note text changed since they were first synced
+    (note_id already present in both staging and main, but with different `note` content).
+    process_customer_notes above is insert-only by design (re-checking every historical note
+    for drift on every regular Stage 3 run would be wasteful) - this is only meant to be
+    called by the refresh_recent_notes backfill job, which only ever looks at a small recent
+    time window, so a full comparison scan here is cheap.
+    """
+    logger.info(f"[update_changed_notes] Checking for changed notes for account_id={account_id}")
+    try:
+        update_sql = text(f"""
+            UPDATE public.{_TABLE} cn
+            SET note = stg.note, note_datetime = stg.note_datetime,
+                updated_at = NOW(), updated_by = -1
+            FROM mt_user_notes_details_dlk stg
+            WHERE cn.account_id = :account_id AND stg.account_id = :account_id
+              AND cn.note_id = stg.note_id
+              AND cn.note IS DISTINCT FROM stg.note
+        """)
+        with engine.begin() as conn:
+            result = conn.execute(update_sql, {"account_id": account_id})
+            updated_count = result.rowcount
+        logger.info(f"[update_changed_notes] SUCCESS: {updated_count} notes updated for account_id={account_id}")
+        return {"updated_records": updated_count}
+    except Exception as e:
+        logger.error(f"[update_changed_notes] ERROR: Failed updating changed notes for account_id={account_id}: {e}")
+        raise

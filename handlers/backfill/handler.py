@@ -5,15 +5,20 @@ Each backfill job is its own event_type + module (see handlers/backfill/notes_an
 adding a new backfill job later means adding a new module and one _EVENT_HANDLERS entry here,
 not a new Lambda / new deploy script.
 
-Reads DATABASE_URL straight from the environment rather than core.config/core.stg_db_config —
-both of those pydantic Settings classes eagerly validate a bunch of CRM/Auth0/S3 fields this
-Lambda has no use for (it only ever needs a Postgres connection string), so importing either
-would force us to configure unrelated env vars just to satisfy validation at import time.
+Reads DATABASE_URL straight from the environment rather than core.stg_db_config, which
+eagerly validates a bunch of Auth0 fields this Lambda has no use for (it only ever needs a
+Postgres connection string), so importing it would force us to configure unrelated env vars
+just to satisfy validation at import time. core.config itself is safe to import now that
+DATABASE_URL is its only strictly-required field (refresh_recent_notes needs it for
+utils.api_client / crm_sync.user_notes).
 
 Required env var: DATABASE_URL
+Required for refresh_recent_notes only: API_KEY (MarianaTek bearer token)
+Optional env var: NOTES_WINDOW_HOURS (refresh_recent_notes only - default 24, see notes_recent.py)
 
 Event payload:
   { "event_type": "backfill_notes_and_tags", "account_id": 4809 }
+  { "event_type": "refresh_recent_notes", "account_id": 4809 }
 """
 
 import os
@@ -22,17 +27,28 @@ import logging
 from sqlalchemy import create_engine
 
 from core.logger import setup_logging
-from handlers.backfill import notes_and_tags
+import utils.api_client as _api_client
+from handlers.backfill import notes_and_tags, notes_recent
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
 _EVENT_HANDLERS = {
     "backfill_notes_and_tags": notes_and_tags.run,
+    "refresh_recent_notes": notes_recent.run,
 }
 
 
 async def async_lambda_handler(event, context=None):
+    # Reset per-invocation state that is bound to the asyncio.run() event loop, which is
+    # closed on the next warm-start call: the shared aiohttp session, and the token buckets
+    # (each holds an asyncio.Lock bound to the loop that first used it — reusing a stale one
+    # on a warm container raises "Event loop is closed"). Same fix as handlers/crm_to_s3.py.
+    # Only refresh_recent_notes uses utils.api_client today, but this is harmless for jobs
+    # that don't touch it.
+    _api_client._session = None
+    _api_client._buckets.clear()
+
     event_type = event.get("event_type")
     account_id = event.get("account_id")
 
@@ -64,6 +80,7 @@ async def async_lambda_handler(event, context=None):
         return {"status": "error", "event_type": event_type, "account_id": account_id, "error": str(e)}
     finally:
         engine.dispose()
+        await _api_client.close_session()
 
 
 def lambda_handler(event, context=None):
