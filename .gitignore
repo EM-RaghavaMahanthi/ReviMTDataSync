@@ -9,6 +9,9 @@
 !crm_sync/
 !db_services/
 !stg_db_services/
+!s3_to_stg_bulk/
+!stg_to_main_bulk/
+!step_functions/
 !schemas/
 !utils/
 !sql_cmds/
@@ -21,6 +24,9 @@
 !crm_sync/**
 !db_services/**
 !stg_db_services/**
+!s3_to_stg_bulk/**
+!stg_to_main_bulk/**
+!step_functions/**
 !schemas/**
 !utils/**
 !sql_cmds/**

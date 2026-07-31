@@ -1,0 +1,171 @@
+{
+  "Comment": "Bulk Silver -> staging -> production. Stage 1 loads the whole window for every account, then Stage 2 promotes one account per Map branch. Substitute ${STAGE_LAMBDA_ARN} and ${PROMOTE_LAMBDA_ARN} before creating the state machine. Execution input: {} for the default window, or {\"start_time\":\"...\",\"end_time\":\"...\"} / {\"delta_minutes\":90}, optionally with \"account_ids\" and \"force\".",
+  "StartAt": "StageSilverDelta",
+  "States": {
+    "StageSilverDelta": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Claims the run slot, creates the stg_*_bulk tables, loads all 13 tables from Silver and runs the widened stale update. Returns the account_ids the Map fans out over.",
+      "Parameters": {
+        "FunctionName": "${STAGE_LAMBDA_ARN}",
+        "Comment": "The execution input is merged in wholesale rather than field by field: a JsonPath to an absent field (start_time on a default-window run) fails the state, and every window field is optional.",
+        "Payload.$": "States.JsonMerge($$.Execution.Input, States.StringToJson(States.Format('{\"action\":\"stage\",\"run_id\":\"{}\"}', $$.Execution.Name)), false)"
+      },
+      "ResultSelector": {
+        "account_ids.$": "$.Payload.account_ids",
+        "staged_rows.$": "$.Payload.staged_rows",
+        "window.$": "$.Payload.window",
+        "run_id.$": "$.Payload.run_id"
+      },
+      "ResultPath": "$.stage",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "ReleaseRunSlot"
+        }
+      ],
+      "Next": "VacuumTargets"
+    },
+
+    "VacuumTargets": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "One VACUUM ANALYZE pass before the Map. The onboarding pipeline vacuums inside each account's run; at Map concurrency that would mean several concurrent VACUUMs over the same tables.",
+      "Parameters": {
+        "FunctionName": "${PROMOTE_LAMBDA_ARN}",
+        "Payload": { "action": "vacuum" }
+      },
+      "ResultPath": "$.vacuum",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Comment": "A failed vacuum is not a reason to skip promotion — it only costs query plan quality.",
+          "Next": "PromoteAccounts"
+        }
+      ],
+      "Next": "PromoteAccounts"
+    },
+
+    "PromoteAccounts": {
+      "Type": "Map",
+      "Comment": "One branch per account. MaxConcurrency is deliberately low: every branch writes to the same production tables through the same RDS instance.",
+      "ItemsPath": "$.stage.account_ids",
+      "MaxConcurrency": 4,
+      "ResultPath": "$.promoteResults",
+      "Iterator": {
+        "StartAt": "PromoteAccount",
+        "States": {
+          "PromoteAccount": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${PROMOTE_LAMBDA_ARN}",
+              "Payload": {
+                "action": "promote",
+                "account_id.$": "$"
+              }
+            },
+            "ResultSelector": {
+              "account_id.$": "$.Payload.account_id",
+              "summary.$": "$.Payload.summary"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Comment": "Staging is deliberately left in place on failure so the window can be re-promoted without re-querying Athena. ReleaseRunSlot frees the slot without dropping the tables.",
+          "Next": "ReleaseRunSlot"
+        }
+      ],
+      "Next": "Cleanup"
+    },
+
+    "Cleanup": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Drops the stg_*_bulk tables and releases the run slot.",
+      "Parameters": {
+        "FunctionName": "${STAGE_LAMBDA_ARN}",
+        "Payload": { "action": "cleanup" }
+      },
+      "ResultPath": "$.cleanup",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Succeeded"
+    },
+
+    "ReleaseRunSlot": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Failure path. Releases the run slot but keeps the staging tables for inspection — a slot left held would otherwise block the next run until STALE_RUN_HOURS elapsed.",
+      "Parameters": {
+        "FunctionName": "${STAGE_LAMBDA_ARN}",
+        "Payload": { "action": "cleanup" }
+      },
+      "ResultPath": "$.cleanup",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.cleanupError",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "Terminal failure — enables Step Functions redrive from the failed state.",
+      "Error": "BulkSilverSyncFailed",
+      "Cause": "See $.error in the execution history for the failing state."
+    },
+
+    "Succeeded": {
+      "Type": "Succeed"
+    }
+  }
+}
