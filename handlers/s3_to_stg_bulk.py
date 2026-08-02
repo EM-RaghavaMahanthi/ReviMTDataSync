@@ -286,9 +286,10 @@ def _reconcile(event: dict, engine) -> dict:
     Same inputs as `stage` minus end_datetime — the window is always (start, now], because
     an upper bound on a "did everything land" check could only hide rows that did not.
 
-    Read-only against production, and self-contained: it loads its own copy of the window
-    into rec_*_bulk rather than reading whatever `stage` left in staging, so it can run
-    before promotion, after cleanup, or on its own.
+    Read-only against the production tables; the only writes are to staging, which it
+    loads and then LEAVES POPULATED — those rows are what stage 2 promotes, so dropping
+    them would mean loading the same window twice. Run `cleanup` afterwards, not before.
+    Note it replaces whatever a previous `stage` left in staging.
     """
     start, _ = _window({**event, "end_datetime": None})
     resolved = staging.resolve_accounts(

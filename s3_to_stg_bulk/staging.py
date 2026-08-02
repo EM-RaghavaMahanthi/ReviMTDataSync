@@ -209,14 +209,9 @@ class _SkipHeader:
         return self._raw.read(size)
 
 
-def load_table(engine, table: str, t0, t1, account_ids: list = None, dest=None) -> int:
-    """
-    Query one table's Silver delta and COPY it into `dest`. Returns the row count.
-
-    `dest` defaults to the staging table; reconcile passes its own so it can load the same
-    window without touching whatever a live stage run has in staging.
-    """
-    stg = dest or cfg.staging_name(table)
+def load_table(engine, table: str, t0, t1, account_ids: list = None) -> int:
+    """Query one table's Silver delta and COPY it into staging. Returns the row count."""
+    stg = cfg.staging_name(table)
     qid = athena.run_query(_select_sql(table, t0, t1, account_ids), label=f"stage:{table}")
     body = athena.result_body(qid)
 
@@ -245,17 +240,11 @@ def load_table(engine, table: str, t0, t1, account_ids: list = None, dest=None) 
     return staged
 
 
-def load_all(engine, t0, t1, account_ids: list = None, dest=None) -> dict:
-    """
-    Load every table. Returns {table: row_count}.
-
-    `dest` is a callable table -> destination name; defaults to the staging tables.
-    """
+def load_all(engine, t0, t1, account_ids: list = None) -> dict:
+    """Load every staging table. Returns {table: row_count}."""
     counts = {}
     for table in cfg.STAGING_ORDER:
-        counts[table] = load_table(
-            engine, table, t0, t1, account_ids, dest=dest(table) if dest else None
-        )
+        counts[table] = load_table(engine, table, t0, t1, account_ids)
     logger.info(f"[stage] total {sum(counts.values())} rows across {len(counts)} tables")
     return counts
 
@@ -366,122 +355,132 @@ def _reconcile_join(table: str) -> tuple:
     """(match condition, absent test) for one table. Every reconciled target is keyed by
     (account_id, business key) — the three that are not are all in cfg.RDS_OWNED."""
     keys = cfg.key_columns(table)
-    on = " AND ".join(["t.account_id = r.account_id"] + [f"t.{k} = r.{k}" for k in keys])
+    on = " AND ".join(["t.account_id = s.account_id"] + [f"t.{k} = s.{k}" for k in keys])
     return on, f"t.{keys[0]} IS NULL"
-
-
-def create_recon_tables(engine) -> list:
-    created = []
-    with engine.begin() as conn:
-        for table in cfg.STAGING_ORDER:
-            name = cfg.recon_name(table)
-            conn.execute(text(cfg.staging_ddl(table, name)))
-            created.append(name)
-    return created
-
-
-def drop_recon_tables(engine) -> list:
-    dropped = []
-    with engine.begin() as conn:
-        for table in cfg.ALL_TABLES:
-            name = cfg.recon_name(table)
-            conn.execute(text(f'DROP TABLE IF EXISTS "{name}"'))
-            dropped.append(name)
-    return dropped
 
 
 def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
     """
-    Is RDS caught up with Silver? Read-only against production.
+    Is RDS caught up with Silver, and what is missing?
 
-    Same load as `stage` — same nine tables, same two-step query, same COPY — but the
-    window has no upper bound: (start, now]. It then LEFT JOINs what Silver holds against
-    the target and counts what did not make it.
+    Same load as `stage` — same nine tables, same two-step query, same COPY into the same
+    stg_*_bulk tables — but the window has no upper bound: (start, now]. It then compares
+    what Silver holds against the target and counts what did not make it.
 
-    Loading its own copy rather than reading whatever `stage` left in staging is what makes
-    this answer the question that matters for a rollover. Reading staging would only prove
-    "everything we staged got promoted", which is silent about events Silver received after
-    the stage run — exactly the ones a catch-up is most likely to drop. It also means there
-    is no ordering constraint: this runs before promotion, after cleanup, or standalone.
+    **Staging is left populated on purpose.** The rows it just loaded are exactly the rows
+    stage 2 needs to promote, so dropping them would mean loading the same window twice.
+    Run `cleanup` when you are done with them, not before — and note that this REPLACES
+    whatever a previous `stage` left in staging.
 
-    Uses rec_*_bulk tables and takes no run slot, so it cannot disturb a live stage. Two
-    concurrent reconciles would interfere; that is an operator error, not a race worth
-    locking against.
+    Read-only against the production tables; the only writes are to staging.
 
     `deleted` is broken out separately: a row Silver has marked deleted that was never
     inserted is usually correct, not a miss, so counting it would create noise every run.
     """
-    report, total_expected, total_missing = {}, 0, 0
+    report, total_expected, total_missing, total_dupes = {}, 0, 0, 0
     end = datetime.now(timezone.utc).replace(tzinfo=None)
 
     logger.info(
         f"[reconcile] window=({start.isoformat()}, {end.isoformat()}] "
-        f"accounts={account_ids} tables={len(cfg.STAGING_ORDER)}"
+        f"accounts={len(account_ids)} tables={len(cfg.STAGING_ORDER)}"
     )
 
-    drop_recon_tables(engine)
-    create_recon_tables(engine)
-    try:
-        loaded = load_all(engine, start, end, account_ids, dest=cfg.recon_name)
+    create_staging_tables(engine)
+    loaded = load_all(engine, start, end, account_ids)
 
-        with engine.connect() as conn:
-            for table in cfg.STAGING_ORDER:
-                rec = cfg.recon_name(table)
-                tgt = cfg.target_table(table)
-                keys = cfg.key_columns(table)
-                on, absent = _reconcile_join(table)
-                deleted = (
-                    "r.deleted_at IS NOT NULL"
-                    if cfg.source_of(table, "deleted_at") else "FALSE"
-                )
-                source = f'"{rec}" r LEFT JOIN {tgt} t ON {on}'
+    with engine.connect() as conn:
+        for table in cfg.STAGING_ORDER:
+            stg = cfg.staging_name(table)
+            tgt = cfg.target_table(table)
+            keys = cfg.key_columns(table)
+            on, _ = _reconcile_join(table)
+            deleted = (
+                "s.deleted_at IS NOT NULL" if cfg.source_of(table, "deleted_at") else "FALSE"
+            )
+            # One LEFT JOIN collapsed back to one row per staged row by grouping on
+            # ctid. Two things this avoids: a bare LEFT JOIN multiplies the staged row by
+            # however many target rows share its business key, silently inflating both the
+            # total and `present`; and a correlated `(SELECT COUNT(*) …) > 1` per row to
+            # detect that is quadratic — it ran fine for one account and timed out across
+            # sixty. Grouping gives the match count per staged row in a single pass, which
+            # is both the duplicate signal and the present/missing test.
+            match = f"EXISTS (SELECT 1 FROM {tgt} t WHERE {on})"
 
-                row = conn.execute(text(f"""
-                    SELECT COUNT(*)                                             AS expected,
-                           COUNT(*) FILTER (WHERE NOT ({absent}))               AS present,
-                           COUNT(*) FILTER (WHERE {absent} AND NOT ({deleted})) AS missing,
-                           COUNT(*) FILTER (WHERE {absent} AND ({deleted}))     AS missing_deleted
-                    FROM {source}
-                    WHERE r.account_id = ANY(:ids)
-                """), {"ids": account_ids}).fetchone()
+            row = conn.execute(text(f"""
+                SELECT COUNT(*)                                        AS in_silver,
+                       COUNT(*) FILTER (WHERE n > 0)                   AS present,
+                       COUNT(*) FILTER (WHERE n = 0 AND NOT deleted)   AS missing,
+                       COUNT(*) FILTER (WHERE n = 0 AND deleted)       AS missing_deleted,
+                       COUNT(*) FILTER (WHERE n > 1)                   AS duplicated
+                FROM (
+                    SELECT s.ctid AS rid,
+                           ({deleted}) AS deleted,
+                           COUNT(t.{keys[0]}) AS n
+                    FROM "{stg}" s
+                    LEFT JOIN {tgt} t ON {on}
+                    WHERE s.account_id = ANY(:ids)
+                    GROUP BY s.ctid, ({deleted})
+                ) x
+            """), {"ids": account_ids}).fetchone()
 
-                expected, present, missing, missing_deleted = (int(v or 0) for v in row)
+            in_silver, present, missing, missing_deleted, duplicated = (
+                int(v or 0) for v in row
+            )
 
-                missing_keys = []
-                if missing:
-                    key_sel = ", ".join(f"r.{k}" for k in keys)
-                    missing_keys = [
-                        dict(zip(["account_id", *keys], m))
-                        for m in conn.execute(text(f"""
-                            SELECT r.account_id, {key_sel}
-                            FROM {source}
-                            WHERE r.account_id = ANY(:ids)
-                              AND {absent} AND NOT ({deleted})
-                            LIMIT :lim
-                        """), {"ids": account_ids, "lim": sample}).fetchall()
-                    ]
+            missing_keys = []
+            if missing:
+                key_sel = ", ".join(f"s.{k}" for k in keys)
+                missing_keys = [
+                    dict(zip(["account_id", *keys], m))
+                    for m in conn.execute(text(f"""
+                        SELECT s.account_id, {key_sel}
+                        FROM "{stg}" s
+                        WHERE s.account_id = ANY(:ids)
+                          AND NOT {match} AND NOT ({deleted})
+                        LIMIT :lim
+                    """), {"ids": account_ids, "lim": sample}).fetchall()
+                ]
 
-                report[table] = {
-                    "target": tgt,
-                    "in_silver": expected,
-                    "present": present,
-                    "missing": missing,
-                    "missing_but_deleted": missing_deleted,
-                    "sample_missing": missing_keys,
+            # Which accounts the shortfall actually falls on. A total says 1% is missing;
+            # this says whether that is spread evenly or concentrated in a few accounts,
+            # which is usually the difference between a systemic gap and a local one.
+            per_account = {}
+            if missing:
+                per_account = {
+                    int(r[0]): int(r[1])
+                    for r in conn.execute(text(f"""
+                        SELECT s.account_id, COUNT(*)
+                        FROM "{stg}" s
+                        WHERE s.account_id = ANY(:ids)
+                          AND NOT {match} AND NOT ({deleted})
+                        GROUP BY s.account_id
+                        ORDER BY COUNT(*) DESC
+                    """), {"ids": account_ids}).fetchall()
                 }
-                total_expected += expected
-                total_missing += missing
 
-                level = logger.error if missing else logger.info
-                level(
-                    f"[reconcile] {table}: silver={expected} present={present} "
-                    f"missing={missing}"
-                    + (f" (+{missing_deleted} deleted, not counted)" if missing_deleted else "")
-                )
-    finally:
-        # Always tear down, including on a failed load — these are scratch tables and
-        # leaving them would confuse the next run's counts.
-        drop_recon_tables(engine)
+            report[table] = {
+                "target": tgt,
+                "in_silver": in_silver,
+                "present": present,
+                "missing": missing,
+                "missing_but_deleted": missing_deleted,
+                "duplicated_in_target": duplicated,
+                "missing_by_account": per_account,
+                "sample_missing": missing_keys,
+            }
+            total_expected += in_silver
+            total_missing += missing
+            total_dupes += duplicated
+
+            # A shortfall is a finding, not a failure — this whole action is read-only
+            # against production. WARNING so it stands out without reading as a crash.
+            level = logger.warning if (missing or duplicated) else logger.info
+            level(
+                f"[reconcile] {table}: silver={in_silver} present={present} "
+                f"missing={missing}"
+                + (f" (+{missing_deleted} deleted, not counted)" if missing_deleted else "")
+                + (f" duplicated_in_target={duplicated}" if duplicated else "")
+            )
 
     return {
         "complete": total_missing == 0,
@@ -490,10 +489,12 @@ def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
         "loaded": loaded,
         "total_in_silver": total_expected,
         "total_missing": total_missing,
+        "total_duplicated_in_target": total_dupes,
         "tables": report,
         # Named, not omitted: "complete: true" must not be read as "everything was
         # checked". These are RDS-owned after the migration — see cfg.RDS_OWNED.
         "not_checked": sorted(cfg.RDS_OWNED),
+        "staging": "left populated for promotion — run cleanup when done",
     }
 
 
