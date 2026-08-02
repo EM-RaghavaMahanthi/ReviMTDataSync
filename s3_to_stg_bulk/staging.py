@@ -15,6 +15,7 @@ from sqlalchemy import text
 from core.bulk_config import settings
 from s3_to_stg_bulk import athena
 from s3_to_stg_bulk import config as cfg
+from s3_to_stg_bulk import update_stale
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +362,17 @@ def _reconcile_join(table: str) -> tuple:
 
 def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
     """
-    Is RDS caught up with Silver, and what is missing?
+    Is RDS caught up with Silver — what is missing, and what is stale?
+
+    Two different shortfalls, and counting only the first is misleading. A row can be
+    present in RDS and still be wrong:
+
+      missing    in Silver, no matching row in the target  -> needs an INSERT (stage 2)
+      differing  present but the values do not match       -> needs the stale UPDATE
+      suppressed present, values differ, but the recency gate holds the update back
+
+    `present` therefore means "a row exists", NOT "the row matches". `complete` requires
+    both missing and differing to be zero.
 
     Same load as `stage` — same nine tables, same two-step query, same COPY into the same
     stg_*_bulk tables — but the window has no upper bound: (start, now]. It then compares
@@ -377,7 +388,9 @@ def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
     `deleted` is broken out separately: a row Silver has marked deleted that was never
     inserted is usually correct, not a miss, so counting it would create noise every run.
     """
-    report, total_expected, total_missing, total_dupes = {}, 0, 0, 0
+    report = {}
+    total_expected = total_missing = total_dupes = 0
+    total_differing = total_suppressed = 0
     end = datetime.now(timezone.utc).replace(tzinfo=None)
 
     logger.info(
@@ -458,10 +471,17 @@ def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
                     """), {"ids": account_ids}).fetchall()
                 }
 
+            # What differs among the rows that ARE present. Same dry-run count the stale
+            # pass uses, so reconcile and `stage` cannot disagree about what is stale.
+            stale = update_stale.update_table(engine, table, account_ids, update=False)
+            differing, suppressed = stale["expected"], stale["suppressed_by_updated_at"]
+
             report[table] = {
                 "target": tgt,
                 "in_silver": in_silver,
                 "present": present,
+                "differing": differing,
+                "suppressed_by_updated_at": suppressed,
                 "missing": missing,
                 "missing_but_deleted": missing_deleted,
                 "duplicated_in_target": duplicated,
@@ -471,24 +491,34 @@ def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
             total_expected += in_silver
             total_missing += missing
             total_dupes += duplicated
+            total_differing += differing
+            total_suppressed += suppressed
 
             # A shortfall is a finding, not a failure — this whole action is read-only
             # against production. WARNING so it stands out without reading as a crash.
-            level = logger.warning if (missing or duplicated) else logger.info
+            level = (
+                logger.warning if (missing or differing or duplicated) else logger.info
+            )
             level(
                 f"[reconcile] {table}: silver={in_silver} present={present} "
-                f"missing={missing}"
+                f"missing={missing} differing={differing}"
+                + (f" (+{suppressed} differ but gated)" if suppressed else "")
                 + (f" (+{missing_deleted} deleted, not counted)" if missing_deleted else "")
                 + (f" duplicated_in_target={duplicated}" if duplicated else "")
             )
 
     return {
-        "complete": total_missing == 0,
+        # Both shortfalls, not just the absent rows. Suppressed rows differ too, but the
+        # recency gate is a deliberate policy choice rather than something the pipeline
+        # failed to do, so it is reported beside `complete` rather than folded into it.
+        "complete": total_missing == 0 and total_differing == 0,
         "accounts": account_ids,
         "window": {"start_datetime": start.isoformat(), "end_datetime": end.isoformat()},
         "loaded": loaded,
         "total_in_silver": total_expected,
         "total_missing": total_missing,
+        "total_differing": total_differing,
+        "total_suppressed_by_updated_at": total_suppressed,
         "total_duplicated_in_target": total_dupes,
         "tables": report,
         # Named, not omitted: "complete: true" must not be read as "everything was
