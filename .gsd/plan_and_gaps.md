@@ -413,12 +413,12 @@ aws lambda invoke --function-name $FN --cli-binary-format raw-in-base64-out \
   --payload '{"action":"reconcile"}' /tmp/rec.json && jq . /tmp/rec.json
 ```
 
-`account_ids` scopes it (default: everything staged). `sample` caps how many missing
-business keys are named per table (default 5) — the `missing` count is always exact, the
-sample is just so you can go look at specific rows.
+`account_ids` is the only parameter, and it just scopes the check — omit it and everything
+currently staged is checked. `missing` is the exact count; `sample_missing` names a few of
+the keys so you can go look at specific rows.
 
 ```bash
---payload '{"action":"reconcile","account_ids":[2367],"sample":50}'
+--payload '{"action":"reconcile","account_ids":[2367]}'
 ```
 
 **Cleanup** — drops the `stg_*_bulk` tables and releases the run slot.

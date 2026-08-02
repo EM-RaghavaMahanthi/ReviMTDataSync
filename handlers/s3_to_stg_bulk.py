@@ -8,7 +8,7 @@ every account at once, then runs the widened stale update.
 One action per invocation; the Step Function sequences them:
 
   stage         (default) resolve the account set, claim the run slot, create staging,
-                load all 13 tables, run update_stale, return the account_ids for the Map
+                load the 9 tables, run update_stale, return the account_ids for the Map
   update_stale  stale update only — for one account or a list. Lets the Step Function
                 move the stale pass into the Map if `stage` starts running long
   reconcile     read-only: prove every staged row reached the target. Run after
@@ -35,7 +35,8 @@ Event:
   {"action": "stage", "delta_minutes": 90}               window = (now-90m, now]
   {"action": "stage", "account_ids": [1410], "run_stale": false, "force": true}
   {"action": "update_stale", "account_id": 1410}         dry run
-  {"action": "reconcile"}                                for everything staged
+  {"action": "reconcile"}                                everything staged
+  {"action": "reconcile", "account_ids": [1410]}         scope it
   {"action": "cleanup"}
 
 Environment variables — see core/bulk_config.py. The load needs DATABASE_URL, REGION,
@@ -135,7 +136,7 @@ def _verify(event: dict, engine) -> dict:
         "namespace": settings.SILVER_NAMESPACE,
         "workgroup": settings.ATHENA_WORKGROUP,
         "output_requested": settings.ATHENA_OUTPUT_LOCATION,
-        "example_table": athena.table_ref(cfg.silver_table("customers")),
+        "example_table": athena.table_ref(cfg.silver_table(cfg.STAGING_ORDER[0])),
     }
 
     return {"status": "success" if ok else "error", "action": "verify", "report": report}
@@ -296,7 +297,7 @@ def _reconcile(event: dict, engine) -> dict:
             "result": {"complete": True, "note": "nothing staged"},
         }
 
-    result = staging.reconcile(engine, account_ids, sample=int(event.get("sample", 5)))
+    result = staging.reconcile(engine, account_ids)
 
     # A shortfall is reported, not raised: the operator decides whether it is explained
     # (a promote that has not run yet) or a real miss. Raising here would also make the

@@ -366,7 +366,14 @@ def _reconcile_spec(table: str) -> dict:
     }
 
 
-def reconcile(engine, account_ids: list, sample: int = 5) -> dict:
+# How many missing business keys to name per table. Not a knob: it exists so a shortfall
+# can be eyeballed without a second query, and anyone who needs the full list should query
+# the staging tables directly — the LIMIT below has no ORDER BY, so which rows come back is
+# arbitrary either way. `missing` is always the exact count.
+_SAMPLE_MISSING = 5
+
+
+def reconcile(engine, account_ids: list) -> dict:
     """
     Prove every row Silver had in the window now exists in the target.
 
@@ -377,7 +384,7 @@ def reconcile(engine, account_ids: list, sample: int = 5) -> dict:
     promotion) but BEFORE `cleanup` — staging is the record of what Silver held for the
     window. Read-only.
 
-    Reports per table: staged, present in target, missing, and up to `sample` missing
+    Reports per table: staged, present in target, missing, and a few of the missing
     business keys so a shortfall can be chased without another query.
 
     `deleted` is broken out separately: a staged row carrying deleted_at that never got
@@ -421,7 +428,7 @@ def reconcile(engine, account_ids: list, sample: int = 5) -> dict:
                         WHERE s.account_id = ANY(:ids)
                           AND {absent} AND NOT ({deleted_expr})
                         LIMIT :lim
-                    """), {"ids": account_ids, "lim": sample}).fetchall()
+                    """), {"ids": account_ids, "lim": _SAMPLE_MISSING}).fetchall()
                 ]
 
             report[table] = {
