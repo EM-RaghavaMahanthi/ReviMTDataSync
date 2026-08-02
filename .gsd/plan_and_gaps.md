@@ -9,7 +9,7 @@ generalised to bulk accounts) and is not assessed here.
 
 | Gap | Change | Where |
 |---|---|---|
-| G1 | `update_stale` is bulk: every statement scoped `account_id = ANY(:account_ids)`. **30 statements per run regardless of account count**, was ~50 per account. Per-account counts kept via `GROUP BY`; per-account failure isolation via `_with_fallback`. | [update_stale.py](../s3_to_stg_bulk/update_stale.py) |
+| G1 | `update_stale` is bulk: every statement scoped `account_id = ANY(:account_ids)`. **26 statements per run regardless of account count**, was ~50 per account. Per-account counts kept via `GROUP BY`; per-account failure isolation via `_with_fallback`. | [update_stale.py](../s3_to_stg_bulk/update_stale.py) |
 | G2 | Option B — onboarding's invariant ported: **4 ref repairs, was 14**; 9 business keys frozen; `LATERAL` → plain equi-join; parent resolved from the **target's** key, not staging's. | [config.py](../s3_to_stg_bulk/config.py), [update_stale.py](../s3_to_stg_bulk/update_stale.py) |
 | G3 | `resolve_accounts()` runs **before** the load, so an invalid id never reaches Athena or staging. | [staging.py](../s3_to_stg_bulk/staging.py) |
 | G4 | Predicate is `status='ACTIVE' AND crm_api_end_point IS NOT NULL`; `crm_config` dropped. | [staging.py](../s3_to_stg_bulk/staging.py) |
@@ -22,7 +22,7 @@ generalised to bulk accounts) and is not assessed here.
 
 Staging table names stay `stg_*_bulk` — existing convention kept, no rename.
 
-**Verified statically** (no DB/AWS access): all four repair statements and all 22 count/update
+**Verified statically** (no DB/AWS access): all four repair statements and all 18 count/update
 statements render; parens balance; no scalar `:account_id` survives; every SET column is staged,
 non-frozen and has a Silver source; every NOT NULL column is `COALESCE`-guarded on both sides; the
 recency gate picks `silver_inserted_at` only where `updated_at` has no Silver source; the
@@ -49,9 +49,9 @@ ref/frozen-key invariant holds in both directions. ASL still parses; all changed
 | # | Requirement | Where | Notes |
 |---|---|---|---|
 | 3 | Direct Silver → staging, no formatting layer | [staging.py:181](../s3_to_stg_bulk/staging.py#L181) | Athena → S3 result CSV → `COPY … FROM STDIN`, streamed through [`_SkipHeader`](../s3_to_stg_bulk/staging.py#L143) so nothing is materialised in the Lambda. Correct call — `credit_transactions` is ~500k rows for a single account. |
-| 3 | Single source of truth for the shape | [config.py](../s3_to_stg_bulk/config.py) | 13 table specs; staging DDL, Athena SELECT list, COPY column order and the stale column set all derive from them. The steps cannot drift apart. |
+| 3 | Single source of truth for the shape | [config.py](../s3_to_stg_bulk/config.py) | 13 table specs, 9 of them active (see `RDS_OWNED`); staging DDL, Athena SELECT list, COPY column order and the stale column set all derive from them. The steps cannot drift apart. |
 | 3 | Dedup to one row per key | [staging.py:103-140](../s3_to_stg_bulk/staging.py#L103-L140) | `ROW_NUMBER() … PARTITION BY account_id, <business key> ORDER BY silver_inserted_at DESC`. Valid because Silver is append-only. Unique index on `(account_id, *key)` backs it. |
-| 5 | Extra columns | [config.mutable_columns](../s3_to_stg_bulk/config.py#L675) | **119 mutable columns across 11 tables**, vs **34 across 9** in [db_services/update_stale.py](../db_services/update_stale.py). Per table: customers 24, reservations 18, credit_transactions_orders 11, class_sessions 10, credit_transactions 10, order_lines 10, membership_instances 9, membership_transactions_orders 9, orders 8, membership_transactions 8, user_notes 2. |
+| 5 | Extra columns | [config.mutable_columns](../s3_to_stg_bulk/config.py#L675) | **84 mutable columns across the 9 active tables**, vs **34 across 9** in [db_services/update_stale.py](../db_services/update_stale.py) — and the onboarding 34 are concentrated in a handful of hand-picked columns. Per table: reservations 16, class_sessions 10, credit_transactions_orders 10, credit_transactions 9, membership_instances 9, membership_transactions_orders 9, orders 7, membership_transactions 7, order_lines 7. |
 | 5 | `updated_by` / `updated_at` stamped | [update_stale.py:115](../s3_to_stg_bulk/update_stale.py#L115) | `updated_by = 1`, `updated_at = now()` appended to every SET list — same actor id as onboarding. |
 | — | Location scoping dropped | [update_stale.py:133](../s3_to_stg_bulk/update_stale.py#L133) | Join is `account_id` + business key only. Correct for bulk. |
 | — | NULL-safety | [update_stale.py:98](../s3_to_stg_bulk/update_stale.py#L98), [:109](../s3_to_stg_bulk/update_stale.py#L109) | NOT NULL columns use `COALESCE(s.col, t.col)` and are excluded from the diff test when staging is NULL, so a NULL from Silver cannot wipe a live value. |
@@ -332,7 +332,7 @@ table for **every** account, and today's loop does not have that problem.
 fallback on failure.**
 
 ```python
-for table in STALE_TABLES:                    # 11 tables, one transaction each
+for table in STALE_TABLES:                    # 9 tables, one transaction each
     try:
         n = bulk_update(engine, table, filtered_accounts)      # fast path: 1 statement
     except Exception:
@@ -391,88 +391,47 @@ fails with `AccessDenied`. See [deployments/README.md](../deployments/README.md)
 
 ### Invoke
 
-`update` defaults to **false** — every command below is a dry run until you add `"update": true`.
-Athena is still queried and staging is still written; only the stale UPDATE is withheld.
+`stage`, `update_stale` and `promote` are the Step Function's job — it sequences them and
+passes the window. The two you run by hand are **reconcile** and **cleanup**.
 
-Resolution order: the event's `update` field wins; absent it, the `BULK_UPDATE` env var
-(deployed as `false`); absent both, false. Membership is tested rather than a plain `.get`, so an
-explicit `"update": false` still overrides `BULK_UPDATE=true` — the safe direction stays reachable
-per invocation. Flipping the env var to `true` makes writing the default for scheduled runs, at the
-cost of that being the behaviour of a bare `{"action":"stage"}`.
+`update` defaults to **false**, so nothing writes until an event sets `"update": true`.
+Resolution order: the event's field wins; absent it the `BULK_UPDATE` env var (deployed as
+`false`); absent both, false. Membership is tested rather than a plain `.get`, so an explicit
+`"update": false` still overrides `BULK_UPDATE=true`.
 
 ```bash
 export AWS_PROFILE=revi
 FN=revi-bulk-s3-to-stg
 ```
 
-**1 — Pre-flight.** Read-only: checks all 13 target tables exist and Athena is configured.
-
-```bash
-aws lambda invoke --function-name $FN \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"verify"}' /tmp/verify.json && jq . /tmp/verify.json
-```
-
-**2 — Dry run, one account, explicit window.** The number to read is
-`stale.tables.<table>.suppressed_by_updated_at` against `.expected` — see the next section.
-
-```bash
-aws lambda invoke --function-name $FN \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "action": "stage",
-    "account_ids": [1410],
-    "start_datetime": "2026-07-30T00:00:00Z",
-    "end_datetime":   "2026-07-31T00:00:00Z"
-  }' /tmp/stage.json && jq . /tmp/stage.json
-```
-
-**3 — Same window, actually writing.**
-
-```bash
-aws lambda invoke --function-name $FN \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "action": "stage",
-    "account_ids": [1410],
-    "start_datetime": "2026-07-30T00:00:00Z",
-    "end_datetime":   "2026-07-31T00:00:00Z",
-    "update": true
-  }' /tmp/stage.json && jq . /tmp/stage.json
-```
-
-**4 — All active accounts, last 10 minutes.** Omitting `account_ids` means every active account;
-omitting the window means `BULK_DELTA_MINUTES` (10) back from now.
-
-```bash
-aws lambda invoke --function-name $FN \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"stage","update":true}' /tmp/stage.json && jq . /tmp/stage.json
-```
-
-**5 — Stage only, defer the stale pass.** Use when `load_elapsed_seconds` approaches the 900 s
-ceiling; run `update_stale` separately (or from inside the Step Function Map).
+**Reconcile** — did every staged row reach the target? Read-only. Must run **after**
+promotion and **before** cleanup: it compares the staging tables against the target, and
+cleanup drops them. Run it after cleanup and it reports `complete: true` against zero rows.
 
 ```bash
 aws lambda invoke --function-name $FN --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"stage","account_ids":[1410,1411],"delta_minutes":90,"run_stale":false}' \
-  /tmp/stage.json
-
-aws lambda invoke --function-name $FN --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"update_stale","account_ids":[1410,1411],"update":true}' \
-  /tmp/stale.json && jq . /tmp/stale.json
+  --payload '{"action":"reconcile"}' /tmp/rec.json && jq . /tmp/rec.json
 ```
 
-**6 — Clean up.** Drops the `stg_*_bulk` tables and releases the run slot. The Step Function does
-this automatically; run it by hand after a manual `stage`.
+`account_ids` scopes it (default: everything staged). `sample` caps how many missing
+business keys are named per table (default 5) — the `missing` count is always exact, the
+sample is just so you can go look at specific rows.
+
+```bash
+--payload '{"action":"reconcile","account_ids":[2367],"sample":50}'
+```
+
+**Cleanup** — drops the `stg_*_bulk` tables and releases the run slot.
 
 ```bash
 aws lambda invoke --function-name $FN --cli-binary-format raw-in-base64-out \
   --payload '{"action":"cleanup"}' /tmp/cleanup.json && jq . /tmp/cleanup.json
 ```
 
-**If a previous run died before `cleanup`,** the run slot is held. A slot older than
-`STALE_RUN_HOURS` (6) is taken over automatically; before that, add `"force": true` to `stage`.
+**If a run died before `cleanup`,** the slot is held. A `stage` that fails after claiming it
+releases it automatically; a timeout or hard kill cannot. A slot older than
+`STALE_RUN_HOURS` (6) is taken over, or add `"force": true` to the next `stage`.
+
 
 ### Reading the response
 
