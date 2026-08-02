@@ -320,19 +320,21 @@ than from the validated set. Same post-hoc filtering as G3.
   The target's `updated_at` is a backend *write* clock; staging's comes from MarianaTek via Silver
   and is systematically older, so the gate may suppress nearly every update the widened column set
   was added to catch. `_count` reports the suppressed count separately
-  ([update_stale.py:141](../s3_to_stg_bulk/update_stale.py#L141)) precisely so a dry run shows the gap
-  — read it before the first real run.
-- **`user_tags` / `customer_tags` are `stale: False`** — staged but never updated. Silver's
-  `customer_tags.deleted_at` tombstone is staged and not propagated, so a tag removed in the CRM
-  stays assigned.
-- **`customers.state_id` / `last_class_date` / `next_class_date` / `tags` are `no_update`**
-  ([config.py:166](../s3_to_stg_bulk/config.py#L166)) — backend owns state assignment; the class
-  dates are recomputed by stage 2.
-- **`order_lines.is_valid` is staged constant `TRUE`** ([config.py:346](../s3_to_stg_bulk/config.py#L346))
+  ([update_stale.py](../s3_to_stg_bulk/update_stale.py)) precisely so a dry run shows the gap.
+  **Two dry runs now say it is real but not fatal** — account 2367 over 24 h: `class_sessions`
+  127 would update vs 204 suppressed, `reservations` 56 vs 130, but `membership_instances` 259 vs
+  1. So the tables the backend rarely touches pass cleanly and the churned ones lose most of their
+  changes. Decide from that number on the real window, not in advance.
+- **`order_lines.is_valid` is staged constant `TRUE`** ([config.py](../s3_to_stg_bulk/config.py))
   — Silver has neither `is_valid` nor `child_orders`, so deferred-payment placeholder detection
   cannot run here. Invalidation arrives as `deleted_at` instead.
-- **Nothing has been executed.** No DB or AWS access when this was written; the SQL was generated and
-  statically checked only.
+- **Frozen business keys.** Nine keys sit in `no_update` so their `*_ref_id` cannot drift — see
+  G2. Making one mutable again without adding its `Ref` back silently breaks the FK.
+
+Three earlier entries here are now moot: `customers`, `user_notes`, `user_tags` and
+`customer_tags` are in `cfg.RDS_OWNED` and are not staged, stale-updated or reconciled at all, so
+their `no_update` columns and the un-propagated `customer_tags.deleted_at` tombstone are no longer
+this pipeline's concern.
 
 ---
 
