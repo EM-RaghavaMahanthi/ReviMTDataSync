@@ -404,22 +404,24 @@ export AWS_PROFILE=revi
 FN=revi-bulk-s3-to-stg
 ```
 
-**Reconcile** — did every staged row reach the target? Read-only. Must run **after**
-promotion and **before** cleanup: it compares the staging tables against the target, and
-cleanup drops them. Run it after cleanup and it reports `complete: true` against zero rows.
+**Reconcile** — is RDS caught up with Silver? Same inputs as `stage` minus
+`end_datetime`: the window is always `(start, now]`, because an upper bound on a
+"did everything land" check could only hide rows that did not.
 
 ```bash
 aws lambda invoke --function-name $FN --cli-binary-format raw-in-base64-out \
-  --payload '{"action":"reconcile"}' /tmp/rec.json && jq . /tmp/rec.json
+  --payload '{"action":"reconcile","account_ids":[2367],"start_datetime":"2026-07-30T00:00:00Z"}' \
+  /tmp/rec.json && jq . /tmp/rec.json
 ```
 
-`account_ids` is the only parameter, and it just scopes the check — omit it and everything
-currently staged is checked. `missing` is the exact count; `sample_missing` names a few of
-the keys so you can go look at specific rows.
+Self-contained: it runs the same nine-table load `stage` runs, into its own `rec_*_bulk`
+tables, then LEFT JOINs that against the target. So it needs no prior run, takes no run
+slot, and can go before promotion, after cleanup or on its own. Reading staging instead
+would only prove "everything we staged got promoted" — silent about anything Silver
+received after the stage run, which is exactly what a catch-up is most likely to drop.
 
-```bash
---payload '{"action":"reconcile","account_ids":[2367]}'
-```
+Costs one Athena pass (~40 s for one account over three days). `missing` is exact;
+`sample_missing` names a few keys per table so you can go look at specific rows.
 
 **Cleanup** — drops the `stg_*_bulk` tables and releases the run slot.
 

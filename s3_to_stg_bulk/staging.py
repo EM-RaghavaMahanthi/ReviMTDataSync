@@ -8,6 +8,7 @@ record credit_transactions at ~500k rows for a single account.
 """
 
 import logging
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 
@@ -208,9 +209,14 @@ class _SkipHeader:
         return self._raw.read(size)
 
 
-def load_table(engine, table: str, t0, t1, account_ids: list = None) -> int:
-    """Query one table's Silver delta and COPY it into staging. Returns the row count."""
-    stg = cfg.staging_name(table)
+def load_table(engine, table: str, t0, t1, account_ids: list = None, dest=None) -> int:
+    """
+    Query one table's Silver delta and COPY it into `dest`. Returns the row count.
+
+    `dest` defaults to the staging table; reconcile passes its own so it can load the same
+    window without touching whatever a live stage run has in staging.
+    """
+    stg = dest or cfg.staging_name(table)
     qid = athena.run_query(_select_sql(table, t0, t1, account_ids), label=f"stage:{table}")
     body = athena.result_body(qid)
 
@@ -239,11 +245,17 @@ def load_table(engine, table: str, t0, t1, account_ids: list = None) -> int:
     return staged
 
 
-def load_all(engine, t0, t1, account_ids: list = None) -> dict:
-    """Load every staging table. Returns {table: row_count}."""
+def load_all(engine, t0, t1, account_ids: list = None, dest=None) -> dict:
+    """
+    Load every table. Returns {table: row_count}.
+
+    `dest` is a callable table -> destination name; defaults to the staging tables.
+    """
     counts = {}
     for table in cfg.STAGING_ORDER:
-        counts[table] = load_table(engine, table, t0, t1, account_ids)
+        counts[table] = load_table(
+            engine, table, t0, t1, account_ids, dest=dest(table) if dest else None
+        )
     logger.info(f"[stage] total {sum(counts.values())} rows across {len(counts)} tables")
     return counts
 
@@ -349,115 +361,138 @@ def resolve_accounts(engine, requested: list = None) -> dict:
 
 
 # ── Reconciliation ──────────────────────────────────────────────────────────
-# Every reconciled target is keyed by (account_id, business key), because the three that
-# are not — customer_notes aside, the two tags targets — are in cfg.RDS_OWNED and never
-# staged. See the note there before re-including them.
 
-
-def _reconcile_spec(table: str) -> dict:
-    """How a staged row is matched to its target row."""
+def _reconcile_join(table: str) -> tuple:
+    """(match condition, absent test) for one table. Every reconciled target is keyed by
+    (account_id, business key) — the three that are not are all in cfg.RDS_OWNED."""
     keys = cfg.key_columns(table)
-    return {
-        "extra": "",
-        "on": " AND ".join(
-            ["t.account_id = s.account_id"] + [f"t.{k} = s.{k}" for k in keys]
-        ),
-        "absent": f"t.{keys[0]} IS NULL",
-    }
+    on = " AND ".join(["t.account_id = r.account_id"] + [f"t.{k} = r.{k}" for k in keys])
+    return on, f"t.{keys[0]} IS NULL"
 
 
-# How many missing business keys to name per table. Not a knob: it exists so a shortfall
-# can be eyeballed without a second query, and anyone who needs the full list should query
-# the staging tables directly — the LIMIT below has no ORDER BY, so which rows come back is
-# arbitrary either way. `missing` is always the exact count.
-_SAMPLE_MISSING = 5
+def create_recon_tables(engine) -> list:
+    created = []
+    with engine.begin() as conn:
+        for table in cfg.STAGING_ORDER:
+            name = cfg.recon_name(table)
+            conn.execute(text(cfg.staging_ddl(table, name)))
+            created.append(name)
+    return created
 
 
-def reconcile(engine, account_ids: list) -> dict:
+def drop_recon_tables(engine) -> list:
+    dropped = []
+    with engine.begin() as conn:
+        for table in cfg.ALL_TABLES:
+            name = cfg.recon_name(table)
+            conn.execute(text(f'DROP TABLE IF EXISTS "{name}"'))
+            dropped.append(name)
+    return dropped
+
+
+def reconcile(engine, account_ids: list, start, sample: int = 5) -> dict:
     """
-    Prove every row Silver had in the window now exists in the target.
+    Is RDS caught up with Silver? Read-only against production.
 
-    For a rollover this is the difference between "we think it worked" and a number: an
-    overlapping window makes a missed event unlikely, it does not make it verifiable.
+    Same load as `stage` — same nine tables, same two-step query, same COPY — but the
+    window has no upper bound: (start, now]. It then LEFT JOINs what Silver holds against
+    the target and counts what did not make it.
 
-    Runs against the staging tables, so it must be called after `stage` (and after
-    promotion) but BEFORE `cleanup` — staging is the record of what Silver held for the
-    window. Read-only.
+    Loading its own copy rather than reading whatever `stage` left in staging is what makes
+    this answer the question that matters for a rollover. Reading staging would only prove
+    "everything we staged got promoted", which is silent about events Silver received after
+    the stage run — exactly the ones a catch-up is most likely to drop. It also means there
+    is no ordering constraint: this runs before promotion, after cleanup, or standalone.
 
-    Reports per table: staged, present in target, missing, and a few of the missing
-    business keys so a shortfall can be chased without another query.
+    Uses rec_*_bulk tables and takes no run slot, so it cannot disturb a live stage. Two
+    concurrent reconciles would interfere; that is an operator error, not a race worth
+    locking against.
 
-    `deleted` is broken out separately: a staged row carrying deleted_at that never got
-    inserted is usually correct behaviour, not a miss, so counting it against the total
-    would create noise on every run.
+    `deleted` is broken out separately: a row Silver has marked deleted that was never
+    inserted is usually correct, not a miss, so counting it would create noise every run.
     """
-    report, total_staged, total_missing = {}, 0, 0
+    report, total_expected, total_missing = {}, 0, 0
+    end = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    with engine.connect() as conn:
-        for table in cfg.RECONCILE_TABLES:
-            stg = cfg.staging_name(table)
-            tgt = cfg.target_table(table)
-            keys = cfg.key_columns(table)
-            spec = _reconcile_spec(table)
-            join, absent, extra = spec["on"], spec["absent"], spec["extra"]
-            # Only the CRM tables carry deleted_at; the notes/tags staging tables stage it
-            # as NULL or not at all.
-            has_deleted = "deleted_at" in cfg.columns(table)
-            deleted_expr = "s.deleted_at IS NOT NULL" if has_deleted else "FALSE"
-            source = f'"{stg}" s{extra} LEFT JOIN {tgt} t ON {join}'
+    logger.info(
+        f"[reconcile] window=({start.isoformat()}, {end.isoformat()}] "
+        f"accounts={account_ids} tables={len(cfg.STAGING_ORDER)}"
+    )
 
-            row = conn.execute(text(f"""
-                SELECT COUNT(*)                                                  AS staged,
-                       COUNT(*) FILTER (WHERE NOT ({absent}))                    AS present,
-                       COUNT(*) FILTER (WHERE {absent} AND NOT ({deleted_expr})) AS missing,
-                       COUNT(*) FILTER (WHERE {absent} AND ({deleted_expr}))     AS missing_deleted
-                FROM {source}
-                WHERE s.account_id = ANY(:ids)
-            """), {"ids": account_ids}).fetchone()
+    drop_recon_tables(engine)
+    create_recon_tables(engine)
+    try:
+        loaded = load_all(engine, start, end, account_ids, dest=cfg.recon_name)
 
-            staged, present, missing, missing_deleted = (int(v or 0) for v in row)
+        with engine.connect() as conn:
+            for table in cfg.STAGING_ORDER:
+                rec = cfg.recon_name(table)
+                tgt = cfg.target_table(table)
+                keys = cfg.key_columns(table)
+                on, absent = _reconcile_join(table)
+                deleted = (
+                    "r.deleted_at IS NOT NULL"
+                    if cfg.source_of(table, "deleted_at") else "FALSE"
+                )
+                source = f'"{rec}" r LEFT JOIN {tgt} t ON {on}'
 
-            missing_keys = []
-            if missing:
-                key_sel = ", ".join(f"s.{k}" for k in keys)
-                missing_keys = [
-                    dict(zip(["account_id", *keys], r))
-                    for r in conn.execute(text(f"""
-                        SELECT s.account_id, {key_sel}
-                        FROM {source}
-                        WHERE s.account_id = ANY(:ids)
-                          AND {absent} AND NOT ({deleted_expr})
-                        LIMIT :lim
-                    """), {"ids": account_ids, "lim": _SAMPLE_MISSING}).fetchall()
-                ]
+                row = conn.execute(text(f"""
+                    SELECT COUNT(*)                                             AS expected,
+                           COUNT(*) FILTER (WHERE NOT ({absent}))               AS present,
+                           COUNT(*) FILTER (WHERE {absent} AND NOT ({deleted})) AS missing,
+                           COUNT(*) FILTER (WHERE {absent} AND ({deleted}))     AS missing_deleted
+                    FROM {source}
+                    WHERE r.account_id = ANY(:ids)
+                """), {"ids": account_ids}).fetchone()
 
-            report[table] = {
-                "target": tgt,
-                "staged": staged,
-                "present": present,
-                "missing": missing,
-                "missing_but_deleted": missing_deleted,
-                "sample_missing": missing_keys,
-            }
-            total_staged += staged
-            total_missing += missing
+                expected, present, missing, missing_deleted = (int(v or 0) for v in row)
 
-            level = logger.error if missing else logger.info
-            level(
-                f"[reconcile] {table}: staged={staged} present={present} "
-                f"missing={missing}"
-                + (f" (+{missing_deleted} deleted, not counted)" if missing_deleted else "")
-            )
+                missing_keys = []
+                if missing:
+                    key_sel = ", ".join(f"r.{k}" for k in keys)
+                    missing_keys = [
+                        dict(zip(["account_id", *keys], m))
+                        for m in conn.execute(text(f"""
+                            SELECT r.account_id, {key_sel}
+                            FROM {source}
+                            WHERE r.account_id = ANY(:ids)
+                              AND {absent} AND NOT ({deleted})
+                            LIMIT :lim
+                        """), {"ids": account_ids, "lim": sample}).fetchall()
+                    ]
+
+                report[table] = {
+                    "target": tgt,
+                    "in_silver": expected,
+                    "present": present,
+                    "missing": missing,
+                    "missing_but_deleted": missing_deleted,
+                    "sample_missing": missing_keys,
+                }
+                total_expected += expected
+                total_missing += missing
+
+                level = logger.error if missing else logger.info
+                level(
+                    f"[reconcile] {table}: silver={expected} present={present} "
+                    f"missing={missing}"
+                    + (f" (+{missing_deleted} deleted, not counted)" if missing_deleted else "")
+                )
+    finally:
+        # Always tear down, including on a failed load — these are scratch tables and
+        # leaving them would confuse the next run's counts.
+        drop_recon_tables(engine)
 
     return {
         "complete": total_missing == 0,
         "accounts": account_ids,
-        "total_staged": total_staged,
+        "window": {"start_datetime": start.isoformat(), "end_datetime": end.isoformat()},
+        "loaded": loaded,
+        "total_in_silver": total_expected,
         "total_missing": total_missing,
         "tables": report,
         # Named, not omitted: "complete: true" must not be read as "everything was
-        # checked". These are RDS-owned after the migration and are never staged — see
-        # cfg.RDS_OWNED.
+        # checked". These are RDS-owned after the migration — see cfg.RDS_OWNED.
         "not_checked": sorted(cfg.RDS_OWNED),
     }
 

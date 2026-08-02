@@ -31,6 +31,11 @@ STAGING_SUFFIX = "_bulk"
 # Control table holding the single run slot. Outlives any one run; never dropped.
 RUN_TABLE = "stg_bulk_run"
 
+# reconcile loads its own copy of the window rather than reading whatever `stage` happened
+# to leave behind, so it needs table names that cannot collide with a live stage run. Same
+# shape, same DDL, different prefix — and no run slot, so it can be run at any time.
+RECON_PREFIX = "rec_"
+
 # Every UPDATE stamps updated_by with this — matches the onboarding pipeline, so bulk
 # rows stay indistinguishable from rows it wrote and distinguishable from user edits.
 ACTOR_ID = 1
@@ -43,6 +48,10 @@ COPY_FORMAT = "csv"
 
 def staging_name(table: str) -> str:
     return f"{STAGING_PREFIX}{table}{STAGING_SUFFIX}"
+
+
+def recon_name(table: str) -> str:
+    return f"{RECON_PREFIX}{table}{STAGING_SUFFIX}"
 
 
 # ── Column type vocabulary ───────────────────────────────────────────────────
@@ -703,6 +712,14 @@ def key(table: str) -> str:
     return cols[0]
 
 
+def column_type(table: str, column: str) -> str:
+    """The Postgres type of one staging column — reconcile builds key-only tables."""
+    for name, pg_type, _ in TABLE_SPECS[table]["columns"]:
+        if name == column:
+            return pg_type
+    raise KeyError(f"{table} has no staging column {column!r}")
+
+
 def ts_columns(table: str) -> tuple:
     return TABLE_SPECS[table]["ts_cols"]
 
@@ -751,7 +768,7 @@ def never_null_columns(table: str) -> set:
     return set(spec["required"]) | set(spec["defaults"])
 
 
-def staging_ddl(table: str) -> str:
+def staging_ddl(table: str, name: str = None) -> str:
     """
     CREATE UNLOGGED TABLE + UNIQUE INDEX for one staging table.
 
@@ -759,7 +776,7 @@ def staging_ddl(table: str) -> str:
     unique index on (account_id, *key) is what lets every downstream statement join
     staging without a DISTINCT ON over it.
     """
-    stg = staging_name(table)
+    stg = name or staging_name(table)
     cols = ",\n  ".join(
         f"{name} {typ}" for name, typ, _ in TABLE_SPECS[table]["columns"]
     )

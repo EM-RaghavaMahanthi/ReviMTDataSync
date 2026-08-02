@@ -283,21 +283,21 @@ def _reconcile(event: dict, engine) -> dict:
     """
     Did every row Silver held for the window reach the target?
 
-    Read-only. Run after `stage` and after promotion, but before `cleanup` — it compares
-    the staging tables against the target, and cleanup drops staging.
+    Same inputs as `stage` minus end_datetime — the window is always (start, now], because
+    an upper bound on a "did everything land" check could only hide rows that did not.
+
+    Read-only against production, and self-contained: it loads its own copy of the window
+    into rec_*_bulk rather than reading whatever `stage` left in staging, so it can run
+    before promotion, after cleanup, or on its own.
     """
-    requested = [int(a) for a in (event.get("account_ids") or [])]
-    if event.get("account_id") is not None:
-        requested.append(int(event["account_id"]))
+    start, _ = _window({**event, "end_datetime": None})
+    resolved = staging.resolve_accounts(
+        engine, [int(a) for a in (event.get("account_ids") or [])]
+        + ([int(event["account_id"])] if event.get("account_id") is not None else [])
+    )
+    account_ids = resolved["accounts"]
 
-    account_ids = requested or staging.staged_account_ids(engine)
-    if not account_ids:
-        return {
-            "status": "success", "action": "reconcile",
-            "result": {"complete": True, "note": "nothing staged"},
-        }
-
-    result = staging.reconcile(engine, account_ids)
+    result = staging.reconcile(engine, account_ids, start)
 
     # A shortfall is reported, not raised: the operator decides whether it is explained
     # (a promote that has not run yet) or a real miss. Raising here would also make the
