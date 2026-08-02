@@ -88,9 +88,11 @@ def create_staging_tables(engine) -> list:
 
 
 def drop_staging_tables(engine) -> list:
+    # ALL_TABLES, not STAGING_ORDER: a table dropped from the active set by a config change
+    # still has a staging table left over from the run before, and cleanup has to remove it.
     dropped = []
     with engine.begin() as conn:
-        for table in cfg.STAGING_ORDER:
+        for table in cfg.ALL_TABLES:
             stg = cfg.staging_name(table)
             conn.execute(text(f'DROP TABLE IF EXISTS "{stg}"'))
             dropped.append(stg)
@@ -347,61 +349,13 @@ def resolve_accounts(engine, requested: list = None) -> dict:
 
 
 # ── Reconciliation ──────────────────────────────────────────────────────────
-# How a staged row is matched to its target row. Ten of the thirteen targets are keyed by
-# (account_id, business key) and use the default below. The notes/tags targets are not,
-# so they get an explicit spec that mirrors the matching stg_to_main_bulk processor —
-# assuming the default for them silently reports every row as missing.
-#
-#   extra   additional FROM entries, joined before the target
-#   on      the staging -> target match
-#   absent  true when no target row matched
-#
-# NOTE: both entries below are for tables in cfg.RECONCILE_SKIP, so neither is reached
-# today. They are kept because the default (account_id, business key) join is actively
-# wrong for these targets — customer_tags_default has no account_id column at all — and
-# whoever removes a table from RECONCILE_SKIP will need them.
-
-_RECONCILE_SPECS = {
-    # customer_tags_default is shared per TENANT, not per account: no account_id column,
-    # keyed by (tenant_name, crm_tag_id). Mirrors
-    # stg_to_main_bulk/customer_tags/default.py step_3.
-    "user_tags": {
-        "extra": "",
-        "on": "t.tenant_name = s.tenant_name AND t.crm_tag_id = s.tag_id",
-        "absent": "t.crm_tag_id IS NULL",
-    },
-    # customer_tag_assignments matches on the RESOLVED default_tag_id, which comes from
-    # customer_tags_default via (tenant_name, crm_tag_id) — and tenant_name is not staged
-    # on customer_tags, so it has to come from the user_tags staging table. Mirrors
-    # stg_to_main_bulk/customer_tags/assignments.py step_count_ready exactly, INNER joins
-    # included.
-    #
-    # The INNER joins matter for how `staged` reads here: a staged tag with no matching
-    # user_tags row, or whose definition is not in customer_tags_default, drops out of the
-    # count entirely rather than being reported missing. That is deliberate — it makes the
-    # denominator "rows stage 2 would attempt", so `missing` means stage 2 tried and did
-    # not land it, not "this row was never insertable". For customer_tags alone, therefore,
-    # `staged` is not the staging table's row count.
-    "customer_tags": {
-        "extra": (
-            ' INNER JOIN "stg_user_tags_bulk" ut'
-            "   ON ut.tag_id = s.tag_id AND ut.account_id = s.account_id"
-            "  INNER JOIN customer_tags_default def"
-            "   ON def.tenant_name = ut.tenant_name AND def.crm_tag_id = ut.tag_id"
-        ),
-        "on": (
-            "t.account_id = s.account_id AND t.customer_id = s.customer_id"
-            " AND t.default_tag_id = def.id"
-        ),
-        "absent": "t.default_tag_id IS NULL",
-    },
-}
+# Every reconciled target is keyed by (account_id, business key), because the three that
+# are not — customer_notes aside, the two tags targets — are in cfg.RDS_OWNED and never
+# staged. See the note there before re-including them.
 
 
 def _reconcile_spec(table: str) -> dict:
-    """The join spec for one table — the explicit one if it has it, else the default."""
-    if table in _RECONCILE_SPECS:
-        return _RECONCILE_SPECS[table]
+    """How a staged row is matched to its target row."""
     keys = cfg.key_columns(table)
     return {
         "extra": "",
@@ -495,8 +449,9 @@ def reconcile(engine, account_ids: list, sample: int = 5) -> dict:
         "total_missing": total_missing,
         "tables": report,
         # Named, not omitted: "complete: true" must not be read as "everything was
-        # checked". These are RDS-owned after the migration — see cfg.RECONCILE_SKIP.
-        "not_checked": sorted(cfg.RECONCILE_SKIP),
+        # checked". These are RDS-owned after the migration and are never staged — see
+        # cfg.RDS_OWNED.
+        "not_checked": sorted(cfg.RDS_OWNED),
     }
 
 

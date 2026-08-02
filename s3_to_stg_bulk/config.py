@@ -517,27 +517,39 @@ TABLE_SPECS: dict = {
     "customer_tags": _CUSTOMER_TAGS,
 }
 
-STAGING_ORDER: list = list(TABLE_SPECS)
-
-# Tables update_stale maintains, in dependency order (parents before children, so a
-# ref_id repair always sees a populated parent).
-STALE_TABLES: list = [t for t in STAGING_ORDER if TABLE_SPECS[t]["stale"]]
-
-# Tables `reconcile` does NOT check, because RDS stays their system of record after the
-# migration — this pipeline is not what fills them, so a row missing from the target is
-# expected rather than a dropped event:
+# Tables this pipeline does NOT touch at all — RDS stays their system of record after the
+# migration, so staging them, stale-updating them or reconciling them is wasted work:
 #
 #   customers      RDS is back-synced from the cloud on its own ~3 min cadence
 #   user_notes     events go to the backend, which writes the notes
 #   user_tags      tag definitions are manipulated backend-side
 #   customer_tags  assignments are manipulated backend-side
 #
-# They are still staged and (where stale=True) still stale-updated; only the "did every
-# event land" check skips them. Reconcile reports them as skipped rather than omitting
-# them, so the coverage gap stays visible in the output.
-RECONCILE_SKIP: set = {"customers", "user_notes", "user_tags", "customer_tags"}
+# Their specs stay in TABLE_SPECS above: the column mapping is correct and verified against
+# Silver, so re-including one should be a one-line edit here rather than a re-derivation.
+#
+# Two things to know before re-including the tags pair: customer_tags_default is shared per
+# TENANT and has no account_id column (keyed on tenant_name + crm_tag_id), and
+# customer_tag_assignments matches on a resolved default_tag_id that needs tenant_name from
+# the user_tags staging table. Both would need a custom join in staging.reconcile; the
+# default (account_id, business key) match is wrong for them.
+RDS_OWNED: set = {"customers", "user_notes", "user_tags", "customer_tags"}
 
-RECONCILE_TABLES: list = [t for t in STAGING_ORDER if t not in RECONCILE_SKIP]
+# The nine tables the bulk pipeline actually moves, in dependency order. Everything —
+# staging DDL, the Athena loads, update_stale and reconcile — works off this list, so the
+# three stay in step by construction.
+STAGING_ORDER: list = [t for t in TABLE_SPECS if t not in RDS_OWNED]
+
+# Every table the specs describe, used only for teardown: cleanup must be able to drop a
+# staging table that a previous, wider version of STAGING_ORDER created, or it orphans it.
+ALL_TABLES: list = list(TABLE_SPECS)
+
+# Tables update_stale maintains, in dependency order (parents before children, so a
+# ref_id repair always sees a populated parent).
+STALE_TABLES: list = [t for t in STAGING_ORDER if TABLE_SPECS[t]["stale"]]
+
+# Reconcile checks exactly what the pipeline moved.
+RECONCILE_TABLES: list = list(STAGING_ORDER)
 
 
 # ── Target tables ───────────────────────────────────────────────────────────
