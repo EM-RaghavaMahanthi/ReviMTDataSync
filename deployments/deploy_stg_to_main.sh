@@ -9,7 +9,7 @@
 set -euo pipefail
 
 LAMBDA_NAME="${LAMBDA_NAME:-revi-data-sync-stg-to-db}"
-AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
+AWS_PROFILE="${AWS_PROFILE:-revi}"
 ZIP_NAME="stg_to_main_deploy.zip"
 BUILD_DIR="stg_to_main_build"
 SOURCE_DIRS=("core" "clients" "handlers" "stg_db_services")

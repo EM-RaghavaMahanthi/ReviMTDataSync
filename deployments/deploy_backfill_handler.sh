@@ -25,7 +25,7 @@
 set -euo pipefail
 
 LAMBDA_NAME="${LAMBDA_NAME:-revi-backfill}"
-AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
+AWS_PROFILE="${AWS_PROFILE:-revi}"
 ZIP_NAME="backfill_handler_deploy.zip"
 BUILD_DIR="backfill_handler_build"
 # backfill_notes_and_tags is Stage-3-only (pure SQLAlchemy, no CRM calls). refresh_recent_notes

@@ -121,7 +121,7 @@ Action-routed; the Step Function sequences the actions.
 | `cleanup` | Drop the staging tables, release the run slot |
 | `verify` | Assert every target table exists and Athena is configured. Writes nothing |
 
-- **Window**: `{"start_time": …, "end_time": …}`, or `{"delta_minutes": 90}`, else the last
+- **Window**: `{"start_datetime": …, "end_datetime": …}`, or `{"delta_minutes": 90}`, else the last
   `BULK_DELTA_MINUTES`. Half-open: `silver_inserted_at > t0 AND <= t1`.
 - **Dedup**: Silver is append-only, so each table is reduced to the newest row per
   `(account_id, business key)` inside the window before loading.
@@ -204,14 +204,14 @@ aws lambda invoke --function-name revi-bulk-s3-to-stg \
   --payload '{"action":"verify"}' /tmp/out.json
 
 aws lambda invoke --function-name revi-bulk-s3-to-stg \
-  --payload '{"action":"stage","start_time":"2026-07-30T00:00:00Z","end_time":"2026-07-31T00:00:00Z"}' /tmp/out.json
+  --payload '{"action":"stage","start_datetime":"2026-07-30T00:00:00Z","end_datetime":"2026-07-31T00:00:00Z"}' /tmp/out.json
 
 aws lambda invoke --function-name revi-bulk-stg-to-main \
   --payload '{"action":"promote","account_id":1410}' /tmp/out.json
 ```
 
 A dry run changes nothing and reports what it would change:
-`{"action":"stage","delta_minutes":90,"dry_run":true}`.
+`{"action":"stage","delta_minutes":90}` (dry run; add `"update":true` to write).
 
 ---
 

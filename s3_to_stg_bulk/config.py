@@ -236,7 +236,9 @@ _ORDERS = {
     "ts_cols": ("date_placed",),
     "required": ("order_id", "account_id"),
     "defaults": {},
-    "no_update": ("location_id", "parent_order"),
+    # customer_id is frozen: orders.customer_ref_id mirrors it, and this pipeline does not
+    # repair customer_ref_id (see REF_SPECS). Freezing the key keeps the pair consistent.
+    "no_update": ("location_id", "parent_order", "customer_id"),
     "stale": True,
 }
 
@@ -266,7 +268,8 @@ _CREDIT_TRANSACTIONS = {
     "ts_cols": ("transaction_date",),
     "required": ("credit_transactions_id", "account_id"),
     "defaults": {},
-    "no_update": (),
+    # Frozen: customer_ref_id mirrors customer_id and is not repaired here.
+    "no_update": ("customer_id",),
     "stale": True,
 }
 
@@ -282,7 +285,8 @@ _CREDIT_TRANSACTIONS_ORDERS = {
     "ts_cols": ("transaction_date",),
     "required": ("credit_transactions_id", "account_id"),
     "defaults": {},
-    "no_update": (),
+    # Frozen: customer_ref_id mirrors customer_id and is not repaired here.
+    "no_update": ("customer_id",),
     "stale": True,
 }
 
@@ -304,7 +308,10 @@ _MEMBERSHIP_TRANSACTIONS = {
     "ts_cols": ("transaction_date",),
     "required": ("membership_transactions_id", "account_id"),
     "defaults": {},
-    "no_update": (),
+    # customer_id frozen (customer_ref_id is not repaired here). membership_instances_id
+    # stays mutable — membership_instances_ref_id IS repaired, matching the onboarding
+    # pipeline's update_membership_transactions.
+    "no_update": ("customer_id",),
     "stale": True,
 }
 
@@ -321,6 +328,9 @@ _MEMBERSHIP_TRANSACTIONS_ORDERS = {
     "ts_cols": ("transaction_date", "payment_interval_end_date"),
     "required": ("membership_transactions_id", "account_id"),
     "defaults": {},
+    # customer_id is NOT frozen here: the backend's membership_transactions_orders has no
+    # customer_ref_id column, so there is no mirrored ref to keep in step.
+    # membership_instances_id stays mutable and its ref is repaired.
     "no_update": (),
     "stale": True,
 }
@@ -351,7 +361,13 @@ _ORDER_LINES = {
     "ts_cols": (),
     "required": ("order_line_id", "account_id"),
     "defaults": {"processed_by": "false"},
-    "no_update": ("is_valid", "child_orders"),
+    # order_id / credit_transactions_id / membership_transactions_id are frozen: each is
+    # mirrored by a *_ref_id this pipeline does not repair. The onboarding pipeline
+    # (update_order_lines) updates title + transaction_type only, for the same reason.
+    "no_update": (
+        "is_valid", "child_orders",
+        "order_id", "credit_transactions_id", "membership_transactions_id",
+    ),
     "stale": True,
 }
 
@@ -385,7 +401,10 @@ _RESERVATIONS = {
     # guest and first_timer are NOT NULL DEFAULT false in the target. Silver computes
     # first_timer, so NULL there means "unknown" — the live value is left alone.
     "defaults": {"guest": "false", "first_timer": "false"},
-    "no_update": (),
+    # customer_id / class_session_id frozen — their ref_ids are not repaired here.
+    # credit_transactions_id / membership_transactions_id stay mutable and their ref_ids
+    # ARE repaired, matching the onboarding pipeline's update_reservations.
+    "no_update": ("customer_id", "class_session_id"),
     "stale": True,
 }
 
@@ -534,11 +553,26 @@ def target_table(table: str) -> str:
 # (ref column on the child, parent logical table, parent business key, child column
 # holding the parent's business key).
 #
-# Silver's own *_ref_id values index Silver, not the backend, so they are never staged.
-# The stale update resolves each one by joining the parent target table.
+# This pipeline does NOT run a general-purpose FK repair pass. Silver's own *_ref_id
+# values index Silver rather than the backend, so they are never staged; a row's ref_id is
+# resolved once, by stg_to_main_bulk, at INSERT time. For a row whose parent pointer never
+# moves there is nothing left to resolve.
 #
-# The split between the plain and _orders variants is why those four tables exist
-# separately, and it is asymmetric — inherited from the onboarding pipeline:
+# The one case that still needs repair is when THIS update changes the business key the
+# ref mirrors: set reservations.credit_transactions_id from 100 to 200 and
+# credit_transactions_ref_id still points at the row for 100.
+#
+# So the invariant, ported verbatim from db_services/update_stale.py, is:
+#
+#     repair a ref_id if and only if the business key it mirrors is mutable.
+#
+# Everything else is kept in step by freezing the key instead — see each spec's
+# `no_update`. That is why customer_ref_id, class_session_ref_id and order_ref_id appear
+# nowhere below: their keys are frozen, so they cannot drift. Keep the two sides in sync —
+# making a frozen key mutable without adding its Ref here silently breaks the FK.
+#
+# The split between the plain and _orders variants is asymmetric, inherited from the
+# onboarding pipeline:
 #   order_lines  → credit_transactions_ORDERS / membership_transactions_ORDERS
 #   reservations → credit_transactions        / membership_transactions
 
@@ -552,45 +586,26 @@ class Ref:
         self.child_key = child_key
 
 
-_CUST_REF = ("customers", "customer_id", "customer_id")
 _MI_REF = ("membership_instances", "membership_instances_id", "membership_instances_id")
 
 REF_SPECS: dict = {
-    "customers": [],
-    "class_sessions": [],
-    "membership_instances": [],
-    "orders": [Ref("customer_ref_id", *_CUST_REF)],
-    "credit_transactions": [Ref("customer_ref_id", *_CUST_REF)],
-    "credit_transactions_orders": [Ref("customer_ref_id", *_CUST_REF)],
-    "membership_transactions": [
-        Ref("customer_ref_id", *_CUST_REF),
-        Ref("membership_instances_ref_id", *_MI_REF),
-    ],
-    # membership_transactions_orders has no customer_ref_id column on the backend.
+    # membership_instances_id is mutable on both → its ref is repaired on both.
+    "membership_transactions": [Ref("membership_instances_ref_id", *_MI_REF)],
     "membership_transactions_orders": [Ref("membership_instances_ref_id", *_MI_REF)],
-    "order_lines": [
-        Ref("order_ref_id", "orders", "order_id", "order_id"),
-        Ref("credit_transactions_ref_id", "credit_transactions_orders",
-            "credit_transactions_id", "credit_transactions_id"),
-        Ref("membership_transactions_ref_id", "membership_transactions_orders",
-            "membership_transactions_id", "membership_transactions_id"),
-    ],
+    # credit_transactions_id / membership_transactions_id are mutable → both repaired.
     "reservations": [
-        Ref("customer_ref_id", *_CUST_REF),
-        Ref("class_session_ref_id", "class_sessions", "class_session_id", "class_session_id"),
         Ref("credit_transactions_ref_id", "credit_transactions",
             "credit_transactions_id", "credit_transactions_id"),
         Ref("membership_transactions_ref_id", "membership_transactions",
             "membership_transactions_id", "membership_transactions_id"),
     ],
-    "user_notes": [Ref("customer_ref_id", *_CUST_REF)],
 }
 
 # The backend marks these @unique, so at most one child row may hold a given parent id.
-# The repair pass has to respect that or it raises a unique violation.
+# The repair has to respect that or it raises a unique violation and takes the whole
+# table's update down with it. The onboarding pipeline omits this guard; it is cheap, and
+# bulk runs over far more rows at once, so the exposure is not comparable.
 UNIQUE_REF_COLS: set = {
-    ("order_lines", "credit_transactions_ref_id"),
-    ("order_lines", "membership_transactions_ref_id"),
     ("reservations", "credit_transactions_ref_id"),
     ("reservations", "membership_transactions_ref_id"),
 }

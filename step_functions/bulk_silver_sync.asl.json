@@ -1,5 +1,5 @@
 {
-  "Comment": "Bulk Silver -> staging -> production. Stage 1 loads the whole window for every account, then Stage 2 promotes one account per Map branch. Substitute ${STAGE_LAMBDA_ARN} and ${PROMOTE_LAMBDA_ARN} before creating the state machine. Execution input: {} for the default window, or {\"start_time\":\"...\",\"end_time\":\"...\"} / {\"delta_minutes\":90}, optionally with \"account_ids\" and \"force\".",
+  "Comment": "Bulk Silver -> staging -> production. Stage 1 loads the whole window for every account, then Stage 2 promotes one account per Map branch. Substitute ${STAGE_LAMBDA_ARN} and ${PROMOTE_LAMBDA_ARN} before creating the state machine. Execution input: {} for the default window, or {\"start_datetime\":\"...\",\"end_datetime\":\"...\"} / {\"delta_minutes\":90}, optionally with \"account_ids\" and \"force\".",
   "StartAt": "StageSilverDelta",
   "States": {
     "StageSilverDelta": {
@@ -8,7 +8,7 @@
       "Comment": "Claims the run slot, creates the stg_*_bulk tables, loads all 13 tables from Silver and runs the widened stale update. Returns the account_ids the Map fans out over.",
       "Parameters": {
         "FunctionName": "${STAGE_LAMBDA_ARN}",
-        "Comment": "The execution input is merged in wholesale rather than field by field: a JsonPath to an absent field (start_time on a default-window run) fails the state, and every window field is optional.",
+        "Comment": "The execution input is merged in wholesale rather than field by field: a JsonPath to an absent field (start_datetime on a default-window run) fails the state, and every window field is optional.",
         "Payload.$": "States.JsonMerge($$.Execution.Input, States.StringToJson(States.Format('{\"action\":\"stage\",\"run_id\":\"{}\"}', $$.Execution.Name)), false)"
       },
       "ResultSelector": {

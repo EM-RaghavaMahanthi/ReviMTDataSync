@@ -7,22 +7,36 @@ every account at once, then runs the widened stale update.
 
 One action per invocation; the Step Function sequences them:
 
-  stage         (default) claim the run slot, create staging, load all 13 tables,
-                run update_stale, return the promotable account_ids for the Map
+  stage         (default) resolve the account set, claim the run slot, create staging,
+                load all 13 tables, run update_stale, return the account_ids for the Map
   update_stale  stale update only — for one account or a list. Lets the Step Function
                 move the stale pass into the Map if `stage` starts running long
   cleanup       drop the staging tables, release the run slot
   verify        assert the target tables are reachable and Athena is configured
 
 Event:
-  {"action": "stage", "start_time": "2026-07-30T00:00:00Z", "end_time": "2026-07-31T00:00:00Z"}
-  {"action": "stage", "delta_minutes": 90}                  window = (now-90m, now]
+  account_ids     which accounts to process. Omitted or empty means every active account.
+                  Ids are intersected with the active set BEFORE anything is loaded, and
+                  anything rejected is named with a reason in the response.
+  start_datetime  ISO-8601. With end_datetime, defines the window explicitly.
+  end_datetime    ISO-8601. Defaults to now.
+  delta_minutes   window length when start_datetime is absent. Falls back to
+                  BULK_DELTA_MINUTES (env, default 10).
+  update          false counts what would change and writes nothing; true performs the
+                  stale update. Falls back to BULK_UPDATE (env, default false) when the
+                  field is absent — an explicit false in the event still wins over the env.
+
+  {"action": "stage", "account_ids": [1410, 1411],
+   "start_datetime": "2026-07-30T00:00:00Z", "end_datetime": "2026-07-31T00:00:00Z",
+   "update": true}
+  {"action": "stage"}                                    window = (now-10m, now], all active
+  {"action": "stage", "delta_minutes": 90}               window = (now-90m, now]
   {"action": "stage", "account_ids": [1410], "run_stale": false, "force": true}
-  {"action": "update_stale", "account_id": 1410, "dry_run": true}
+  {"action": "update_stale", "account_id": 1410}         dry run
   {"action": "cleanup"}
 
 Environment variables — see core/bulk_config.py. The load needs DATABASE_URL, REGION,
-SILVER_NAMESPACE, ATHENA_OUTPUT_LOCATION and ATHENA_WORKGROUP at minimum.
+SILVER_NAMESPACE, ATHENA_CATALOG, ATHENA_WORKGROUP and ATHENA_OUTPUT_BUCKET at minimum.
 """
 
 import json
@@ -36,9 +50,10 @@ from sqlalchemy import create_engine, text
 
 from core.bulk_config import settings
 from core.logger import setup_logging
+from s3_to_stg_bulk import athena
 from s3_to_stg_bulk import config as cfg
 from s3_to_stg_bulk import staging
-from s3_to_stg_bulk.update_stale import update_stale_data, update_stale_data_for_accounts
+from s3_to_stg_bulk.update_stale import update_stale_data
 
 setup_logging(log_level="INFO")
 logger = logging.getLogger(__name__)
@@ -55,14 +70,15 @@ def _parse_dt(value: str) -> datetime:
 
 def _window(event: dict) -> tuple:
     """
-    (start, end] as naive UTC. Explicit start_time/end_time wins; otherwise the window is
-    the last delta_minutes (event) or BULK_DELTA_MINUTES (env) up to now.
+    (start, end] as naive UTC. Explicit start_datetime/end_datetime wins; otherwise the
+    window is the last delta_minutes (event) or BULK_DELTA_MINUTES (env, default 10) up
+    to now.
     """
-    end = _parse_dt(event["end_time"]) if event.get("end_time") else \
+    end = _parse_dt(event["end_datetime"]) if event.get("end_datetime") else \
         datetime.now(timezone.utc).replace(tzinfo=None)
 
-    if event.get("start_time"):
-        start = _parse_dt(event["start_time"])
+    if event.get("start_datetime"):
+        start = _parse_dt(event["start_datetime"])
     else:
         minutes = int(event.get("delta_minutes") or settings.BULK_DELTA_MINUTES)
         start = end - timedelta(minutes=minutes)
@@ -71,6 +87,19 @@ def _window(event: dict) -> tuple:
         raise ValueError(f"empty window: start={start.isoformat()} end={end.isoformat()}")
 
     return start, end
+
+
+def _update_flag(event: dict) -> bool:
+    """
+    Whether the stale pass writes. Event field wins, else BULK_UPDATE (env, default false).
+
+    Membership is tested rather than event.get("update", …) so an explicit "update": false
+    still overrides an env var set to true — the safe direction has to be reachable per
+    invocation.
+    """
+    if "update" in event:
+        return bool(event["update"])
+    return bool(settings.BULK_UPDATE)
 
 
 def _engine():
@@ -98,15 +127,13 @@ def _verify(event: dict, engine) -> dict:
             report[table] = {"target": tgt, "exists": bool(exists)}
             ok = ok and bool(exists)
 
-    if not settings.ATHENA_OUTPUT_LOCATION:
-        report["athena"] = "ATHENA_OUTPUT_LOCATION is not set"
-        ok = False
-    else:
-        report["athena"] = {
-            "namespace": settings.SILVER_NAMESPACE,
-            "workgroup": settings.ATHENA_WORKGROUP,
-            "output": settings.ATHENA_OUTPUT_LOCATION,
-        }
+    report["athena"] = {
+        "catalog": athena.catalog(),
+        "namespace": settings.SILVER_NAMESPACE,
+        "workgroup": settings.ATHENA_WORKGROUP,
+        "output_requested": settings.ATHENA_OUTPUT_LOCATION,
+        "example_table": athena.table_ref(cfg.silver_table("customers")),
+    }
 
     return {"status": "success" if ok else "error", "action": "verify", "report": report}
 
@@ -115,39 +142,90 @@ def _stage(event: dict, engine) -> dict:
     start, end = _window(event)
     account_ids = [int(a) for a in (event.get("account_ids") or [])]
     run_stale = event.get("run_stale", True)
-    dry_run = bool(event.get("dry_run", False))
+    update = _update_flag(event)
     run_id = event.get("run_id") or f"bulk-{uuid.uuid4().hex[:12]}"
 
     logger.info(
         f"[stage] run_id={run_id} window=({start.isoformat()}, {end.isoformat()}] "
-        f"accounts={account_ids or 'all'} run_stale={run_stale} dry_run={dry_run}"
+        f"accounts={account_ids or 'all'} run_stale={run_stale} update={update}"
     )
 
+    # Resolve the account set FIRST — an invalid or inactive id must never reach the
+    # Athena scan or staging.
+    resolved = staging.resolve_accounts(engine, account_ids)
+
+    # Then prove Athena is reachable and the Silver namespace resolves, BEFORE taking the
+    # run slot. Anything that fails after the slot is claimed leaves it held until
+    # STALE_RUN_HOURS elapses or someone passes force=true, so cheap preconditions belong
+    # in front of it.
+    athena.preflight(cfg.silver_table(cfg.STAGING_ORDER[0]))
+
     staging.claim_run_slot(engine, run_id, force=bool(event.get("force", False)))
-    staging.create_staging_tables(engine)
 
-    t0 = time.time()
-    staged = staging.load_all(engine, start, end, account_ids)
-    load_elapsed = round(time.time() - t0, 2)
+    # Everything past the claim runs under a release-on-failure guard. Without it a run
+    # that dies here holds the slot until STALE_RUN_HOURS elapses or an operator passes
+    # force=true — a six-hour wedge caused by, say, a bad env var.
+    #
+    # Releasing is safe: the slot exists only to stop a second run dropping and recreating
+    # the fixed-name stg_*_bulk tables under a live one. A stage that failed is not live,
+    # and the next run recreates those tables anyway, so there is nothing left to protect.
+    #
+    # The staging tables are deliberately NOT dropped — same choice the Step Function's
+    # failure path makes. Whatever loaded stays available to inspect, or to promote
+    # without re-reading Silver.
+    try:
+        staging.create_staging_tables(engine)
 
-    accounts = staging.promotable_account_ids(engine)
+        t0 = time.time()
+        staged = staging.load_all(engine, start, end, resolved["accounts"])
+        load_elapsed = round(time.time() - t0, 2)
 
-    stale = None
-    if run_stale and accounts["account_ids"]:
-        stale = update_stale_data_for_accounts(engine, accounts["account_ids"], dry_run)
+        # Of the accounts we loaded for, the ones that actually had rows in the window.
+        # Only these are worth a Map branch.
+        with_rows = set(staging.staged_account_ids(engine))
+        processed = [a for a in resolved["accounts"] if a in with_rows]
+        no_rows = [a for a in resolved["accounts"] if a not in with_rows]
+        if no_rows:
+            logger.info(f"[stage] {len(no_rows)} accounts had no rows in the window: {no_rows}")
+
+        stale = None
+        if run_stale and processed:
+            stale = update_stale_data(engine, processed, update)
+
+    except Exception:
+        # Best-effort: a release that itself fails must not mask the original error, which
+        # is the one worth reading.
+        try:
+            staging.release_run_slot(engine)
+            logger.error(
+                f"[stage] run_id={run_id} failed — run slot released, staging left in "
+                f"place. Re-run without force once the cause is fixed."
+            )
+        except Exception as release_error:
+            logger.error(
+                f"[stage] run_id={run_id} failed AND the run slot could not be released "
+                f"({release_error}). The next run needs {{\"force\": true}}."
+            )
+        raise
 
     response = {
         "status": "success",
         "action": "stage",
         "run_id": run_id,
-        "window": {"start_time": start.isoformat(), "end_time": end.isoformat()},
+        "window": {"start_datetime": start.isoformat(), "end_datetime": end.isoformat()},
         "staged": staged,
         "staged_rows": sum(staged.values()),
         "load_elapsed_seconds": load_elapsed,
-        # The Map input. Empty means the window held nothing promotable — the Step
-        # Function's Map handles that as zero iterations.
-        "account_ids": accounts["account_ids"],
-        "skipped_inactive_accounts": accounts["skipped"],
+        # The Map input. Empty means the window held nothing — the Step Function's Map
+        # handles that as zero iterations.
+        "account_ids": processed,
+        "accounts": {
+            "requested": account_ids or "all_active",
+            "resolved": resolved["accounts"],
+            "processed": processed,
+            "no_rows_in_window": no_rows,
+            "rejected": resolved["rejected"],
+        },
         "stale": stale,
     }
 
@@ -161,25 +239,38 @@ def _stage(event: dict, engine) -> dict:
 
 
 def _update_stale(event: dict, engine) -> dict:
-    dry_run = bool(event.get("dry_run", False))
-    account_ids = [int(a) for a in (event.get("account_ids") or [])]
+    update = _update_flag(event)
+    requested = [int(a) for a in (event.get("account_ids") or [])]
     if event.get("account_id") is not None:
-        account_ids.append(int(event["account_id"]))
-    if not account_ids:
-        account_ids = staging.promotable_account_ids(engine)["account_ids"]
+        requested.append(int(event["account_id"]))
 
-    if len(account_ids) == 1:
-        result = update_stale_data(engine, account_ids[0], dry_run)
-        status = "success" if result["success"] else "error"
-    else:
-        result = update_stale_data_for_accounts(engine, account_ids, dry_run)
-        status = "success" if result["success"] else "error"
+    # Same validation path as `stage`: an id supplied here gets checked against the active
+    # set too, rather than being trusted because it came from an operator.
+    resolved = staging.resolve_accounts(engine, requested)
+
+    # The update joins staging, so an account with nothing staged has no work. Skipping it
+    # here just avoids the round trips.
+    with_rows = set(staging.staged_account_ids(engine))
+    account_ids = [a for a in resolved["accounts"] if a in with_rows]
+
+    if not account_ids:
+        return {
+            "status": "success",
+            "action": "update_stale",
+            "account_ids": [],
+            "rejected": resolved["rejected"],
+            "update": update,
+            "result": {"success": True, "accounts": 0, "note": "nothing staged"},
+        }
+
+    result = update_stale_data(engine, account_ids, update)
 
     return {
-        "status": status,
+        "status": "success" if result["success"] else "error",
         "action": "update_stale",
         "account_ids": account_ids,
-        "dry_run": dry_run,
+        "rejected": resolved["rejected"],
+        "update": update,
         "result": result,
     }
 

@@ -107,7 +107,7 @@ def _select_sql(table: str, t0, t1, account_ids: list) -> str:
     Deduplicating inside the window is correct because Silver is append-only: if a key
     was written during the window, its newest row is also in the window.
     """
-    fqn = athena.fqn(cfg.silver_table(table))
+    fqn = athena.table_ref(cfg.silver_table(table))
     select = ",\n         ".join(cfg.select_list(table))
     out_cols = ", ".join(cfg.columns(table))
     partition = ", ".join(["account_id", *cfg.key_sources(table)])
@@ -236,39 +236,86 @@ def staged_account_ids(engine) -> list:
 
 def active_account_ids(engine) -> set:
     """
-    Accounts the pipeline is allowed to write to — the same definition
-    clients/db_client.DatabaseManager.get_active_accounts uses.
+    Accounts the pipeline is allowed to write to.
 
     Silver holds data for accounts that are no longer active (or were never onboarded on
     this environment); promoting those would create rows nothing reads.
+
+    Deliberately NOT the same predicate as
+    clients/db_client.DatabaseManager.get_active_accounts, which also requires
+    crm_config IS NOT NULL. The bulk path reads Silver rather than the CRM API, so it does
+    not need the API credentials crm_config holds — only a tenant that exists upstream,
+    which crm_api_end_point establishes. Do not "restore" the crm_config check.
     """
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT id FROM accounts
             WHERE status = 'ACTIVE'
-              AND crm_config IS NOT NULL
               AND crm_api_end_point IS NOT NULL
         """)).fetchall()
     return {int(r[0]) for r in rows}
 
 
-def promotable_account_ids(engine) -> dict:
+def resolve_accounts(engine, requested: list = None) -> dict:
     """
-    {"account_ids": [...], "skipped": [...]} — staged accounts split by whether they are
-    active. The skipped list is returned (and logged) rather than silently dropped.
-    """
-    staged = staged_account_ids(engine)
-    active = active_account_ids(engine)
-    promotable = [a for a in staged if a in active]
-    skipped = [a for a in staged if a not in active]
+    Decide which accounts this run will touch, BEFORE anything is loaded.
 
-    if skipped:
+    {"accounts": [...], "rejected": [{"account_id": …, "reason": …}, …]}
+
+    An empty/absent `requested` means "every active account". Otherwise the requested list
+    is intersected with the active set, and every id that falls out is named with why —
+    the caller asked for it, so silently dropping it would hide a typo'd account id behind
+    a successful run.
+
+    Resolving here rather than after the load is what keeps an invalid id out of the
+    Athena scan and out of staging entirely.
+    """
+    active = active_account_ids(engine)
+
+    if not requested:
+        accounts = sorted(active)
+        logger.info(f"[accounts] no account_ids supplied — using all {len(accounts)} active")
+        return {"accounts": accounts, "rejected": []}
+
+    requested = sorted(dict.fromkeys(int(a) for a in requested))
+    accounts = [a for a in requested if a in active]
+    missing = [a for a in requested if a not in active]
+
+    rejected = []
+    if missing:
+        # One query for the reason, so the report distinguishes "no such account" from
+        # "exists but is not eligible" instead of lumping both into "skipped".
+        with engine.connect() as conn:
+            rows = {
+                int(r[0]): (r[1], bool(r[2]))
+                for r in conn.execute(text("""
+                    SELECT id, status, (crm_api_end_point IS NOT NULL)
+                    FROM accounts WHERE id = ANY(:ids)
+                """), {"ids": missing}).fetchall()
+            }
+        for account_id in missing:
+            if account_id not in rows:
+                reason = "no such account"
+            elif rows[account_id][0] != "ACTIVE":
+                reason = f"status={rows[account_id][0]!r}, expected 'ACTIVE'"
+            elif not rows[account_id][1]:
+                reason = "crm_api_end_point IS NULL"
+            else:
+                reason = "not in the active set"
+            rejected.append({"account_id": account_id, "reason": reason})
+
         logger.warning(
-            f"[stage] {len(skipped)} staged accounts are not active and will not be "
-            f"promoted: {skipped}"
+            f"[accounts] {len(rejected)} of {len(requested)} requested accounts rejected: "
+            f"{rejected}"
         )
-    logger.info(f"[stage] {len(promotable)} promotable accounts: {promotable}")
-    return {"account_ids": promotable, "skipped": skipped}
+
+    if not accounts:
+        raise ValueError(
+            f"none of the requested accounts are active: {rejected}"
+        )
+
+    logger.info(f"[accounts] {len(accounts)} to process: {accounts}")
+    return {"accounts": accounts, "rejected": rejected}
 
 
 def staged_counts_for_account(engine, account_id: int) -> dict:

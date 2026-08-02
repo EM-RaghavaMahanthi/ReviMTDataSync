@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     TEAMS_MAX_RETRIES: int = 5
     TEAMS_TIMEOUT_SECONDS: int = 30
 
-    AWS_PROFILE_NAME: str = "raghava.revi"  
+    AWS_PROFILE_NAME: str = "revi"  
     
     # Individual S3 prefix fields (used if s3_prefixes is not provided)
     CUSTOMERS_S3_PREFIX: str = "customers/"

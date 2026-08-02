@@ -14,16 +14,45 @@ class Settings(BaseSettings):
     # ── Silver reads (Athena over the Iceberg tables) ─────────────────────────
     REGION: str = "us-east-1"
     SILVER_NAMESPACE: str = "silver"
-    ATHENA_CATALOG: str = "awsdatacatalog"
-    ATHENA_WORKGROUP: str = "primary"
-    ATHENA_OUTPUT_LOCATION: str = ""       # s3://.../ — required by the stage action
+
+    # The Silver tables are S3 Tables (managed Iceberg), NOT the default Glue catalog —
+    # `silver` does not exist in AwsDataCatalog. The catalog name contains a '/', so every
+    # SQL reference to it has to be double-quoted; athena.fqn does that. Matches
+    # reviDataInsightsAPI/revi-cloud-campaign's ATHENA_CATALOG.
+    ATHENA_CATALOG: str = "s3tablescatalog/revi-crm-data"
+
+    # The data-lake workgroup, same as reviDataInsightsAPI/revi-dlk-gold. It sets
+    # EnforceWorkGroupConfiguration=true with its own output location
+    # (s3://revi-datalake-athena/athena-results/), so whatever we pass in
+    # ResultConfiguration is overridden. That is fine — the enforced location is exactly
+    # what the execution role grants, and athena.result_location reads the real location
+    # back from Athena rather than assuming ours was used.
+    ATHENA_WORKGROUP: str = "revi-dlk-gold"
+
+    # Bucket name only, not a URI — matching revi-dlk-gold's ATHENA_OUTPUT_BUCKET. Required,
+    # so a missing value fails at import rather than after the run slot has been claimed
+    # and 13 staging tables created.
+    ATHENA_OUTPUT_BUCKET: str
+
+    # The execution role grants s3:GetObject/PutObject only under
+    # revi-datalake-athena/{athena-results,temp,athena-ddl-results}/ — stay inside one.
+    ATHENA_OUTPUT_PREFIX: str = "athena-results"
+
     ATHENA_TIMEOUT_SECONDS: float = 600.0  # a day-wide delta far exceeds any 60s default
 
     # ── Window ───────────────────────────────────────────────────────────────
-    # Used when the event supplies neither start_time/end_time nor delta_minutes.
-    BULK_DELTA_MINUTES: int = 60
+    # Fallback window length. Precedence: event.delta_minutes > this > nothing.
+    # Only consulted when the event supplies neither start_datetime/end_datetime nor its
+    # own delta_minutes.
+    BULK_DELTA_MINUTES: int = 10
 
     # ── Stale update ─────────────────────────────────────────────────────────
+    # Whether the stale pass actually writes. False means a dry run: it counts what would
+    # change, logs it, and writes nothing. Deliberately False so a misconfigured or
+    # accidental invocation cannot rewrite production rows.
+    # Precedence: the event's "update" field overrides this per invocation.
+    BULK_UPDATE: bool = False
+
     # Also require staging.updated_at > target.updated_at before overwriting a column.
     # Be aware this suppresses most real updates: the target's updated_at is a backend
     # write clock (every insert sets now()), while staging's comes from MarianaTek via
@@ -46,6 +75,18 @@ class Settings(BaseSettings):
     TEAMS_TIMEOUT_SECONDS: int = 30
 
     ENVIRONMENT: str = "prod"
+
+    @property
+    def ATHENA_OUTPUT_LOCATION(self) -> str:
+        """
+        Where Athena is asked to write results. Composed rather than configured so the
+        bucket and prefix cannot drift apart, and so the bucket stays a plain name that
+        matches revi-dlk-gold's ATHENA_OUTPUT_BUCKET.
+
+        Note the ATHENA_WORKGROUP above enforces its own location, so in practice this is
+        what we request and the workgroup's value is what Athena uses.
+        """
+        return f"s3://{self.ATHENA_OUTPUT_BUCKET}/{self.ATHENA_OUTPUT_PREFIX.strip('/')}/"
 
     class Config:
         env_file = ".env"

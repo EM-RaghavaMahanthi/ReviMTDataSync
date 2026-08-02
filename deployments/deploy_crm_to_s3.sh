@@ -9,7 +9,7 @@
 set -euo pipefail
 
 LAMBDA_NAME="${LAMBDA_NAME:-revi-syncdata-test}"
-AWS_PROFILE="${AWS_PROFILE:-raghava.revi}"
+AWS_PROFILE="${AWS_PROFILE:-revi}"
 ZIP_NAME="crm_to_s3_deploy.zip"
 BUILD_DIR="crm_to_s3_build"
 SOURCE_DIRS=("core" "clients" "handlers" "crm_sync" "schemas" "utils")

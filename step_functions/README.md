@@ -50,7 +50,7 @@ aws stepfunctions start-execution --state-machine-arn <arn> --input '{}'
 
 # explicit window
 aws stepfunctions start-execution --state-machine-arn <arn> \
-  --input '{"start_time":"2026-07-30T00:00:00Z","end_time":"2026-07-31T00:00:00Z"}'
+  --input '{"start_datetime":"2026-07-30T00:00:00Z","end_datetime":"2026-07-31T00:00:00Z"}'
 
 # one account, taking over a stale run slot
 aws stepfunctions start-execution --state-machine-arn <arn> \
