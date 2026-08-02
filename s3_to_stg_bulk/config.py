@@ -523,6 +523,22 @@ STAGING_ORDER: list = list(TABLE_SPECS)
 # ref_id repair always sees a populated parent).
 STALE_TABLES: list = [t for t in STAGING_ORDER if TABLE_SPECS[t]["stale"]]
 
+# Tables `reconcile` does NOT check, because RDS stays their system of record after the
+# migration — this pipeline is not what fills them, so a row missing from the target is
+# expected rather than a dropped event:
+#
+#   customers      RDS is back-synced from the cloud on its own ~3 min cadence
+#   user_notes     events go to the backend, which writes the notes
+#   user_tags      tag definitions are manipulated backend-side
+#   customer_tags  assignments are manipulated backend-side
+#
+# They are still staged and (where stale=True) still stale-updated; only the "did every
+# event land" check skips them. Reconcile reports them as skipped rather than omitting
+# them, so the coverage gap stays visible in the output.
+RECONCILE_SKIP: set = {"customers", "user_notes", "user_tags", "customer_tags"}
+
+RECONCILE_TABLES: list = [t for t in STAGING_ORDER if t not in RECONCILE_SKIP]
+
 
 # ── Target tables ───────────────────────────────────────────────────────────
 # Logical (Silver) name → production table. Identity for the ten CRM tables; the

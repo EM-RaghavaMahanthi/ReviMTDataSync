@@ -16,7 +16,9 @@ generalised to bulk accounts) and is not assessed here.
 | G5 | `start_datetime` / `end_datetime`; `BULK_DELTA_MINUTES` 60 → **10**, parameter still wins. | [handlers](../handlers/s3_to_stg_bulk.py), [bulk_config.py](../core/bulk_config.py) |
 | G6 | Response reports `requested` / `resolved` / `processed` / `no_rows_in_window` / `rejected`, each rejection with a reason. | [handlers](../handlers/s3_to_stg_bulk.py) |
 | G7 | The standalone `update_stale` action goes through the same `resolve_accounts` path. | [handlers](../handlers/s3_to_stg_bulk.py) |
-| — | `dry_run` → **`update`** (default `False` = dry run), matching `db_services/update_stale`. | throughout |
+| — | `dry_run` → **`update`** (default `False` = dry run), matching `db_services/update_stale`. Deployed with `BULK_UPDATE=false`, so the stale pass writes nothing until an event sets `"update": true`. | throughout |
+| — | **No upper bound on the value fetch.** The window picks *which keys* changed; each key's current version is then read unbounded above, so a historical catch-up cannot stage a superseded value (and cannot lock the correction out via `updated_at = now()`). | [staging.py](../s3_to_stg_bulk/staging.py) |
+| — | **`reconcile` action** — proves every staged row reached the target, naming sample keys for anything missing. Covers the 9 transactional tables; the 4 RDS-owned ones are reported as `not_checked`. | [staging.py](../s3_to_stg_bulk/staging.py), [handlers](../handlers/s3_to_stg_bulk.py) |
 
 Staging table names stay `stg_*_bulk` — existing convention kept, no rename.
 
@@ -502,6 +504,72 @@ aws lambda invoke --function-name $FN --cli-binary-format raw-in-base64-out \
 
 `status` is `"partial"` when staging succeeded but the stale pass failed for some accounts — the
 rows are staged and promotion can still run.
+
+---
+
+## Rollover runbook — catching RDS up from Silver
+
+The scenario this exists for: backend webhook endpoints are stopped during the migration,
+cloud webhooks keep running, and if the rollover has to be reversed, RDS needs whatever
+Silver captured while the backend was blind — perhaps 2–3 hours across all accounts.
+
+Webhook → SQS → bronze (~1 min drain) → silver, roughly **3 minutes end to end**.
+
+**Re-enable backend webhooks FIRST, then catch up.** The reverse order — catch up, then
+re-enable — leaves a gap between the window's `end` and the moment webhooks resume, and
+events in that gap exist only in the cloud. An overlap costs nothing: stage 2 skips rows
+that already exist, and the recency gate lets a live webhook write beat an older Silver
+value. A gap is not recoverable.
+
+1. Re-enable backend webhooks.
+2. Wait ~5 min (3 min pipeline + margin) so Silver has absorbed the outage tail.
+3. Dry run — `update` defaults false, so this writes nothing:
+   ```bash
+   aws lambda invoke --function-name revi-bulk-s3-to-stg --cli-binary-format raw-in-base64-out \
+     --payload '{"action":"stage","start_datetime":"<outage_start − 5min>","end_datetime":"<now>"}' \
+     /tmp/stage.json
+   ```
+4. Read `stale.tables.*.expected` against `suppressed_by_updated_at` before writing.
+5. Re-run with `"update": true`.
+6. **Promote** — stage 2 (`stg_to_main_bulk`). Stage 1 only UPDATEs; every entity *created*
+   during the outage needs this or it is silently lost.
+7. **Reconcile**, before cleanup:
+   ```bash
+   aws lambda invoke --function-name revi-bulk-s3-to-stg --cli-binary-format raw-in-base64-out \
+     --payload '{"action":"reconcile"}' /tmp/rec.json
+   ```
+   Expect `complete: true`. Anything in `missing` comes with sample business keys.
+8. `{"action":"cleanup"}`.
+
+### What reconcile does and does not cover
+
+Nine transactional tables are checked. Four are in `cfg.RECONCILE_SKIP` because RDS stays
+their system of record after the migration — a row missing there is expected, not a lost
+event:
+
+| skipped | why |
+|---|---|
+| `customers` | RDS is back-synced from the cloud on its own ~3 min cadence |
+| `user_notes` | events go to the backend, which writes the notes |
+| `user_tags` | tag definitions are manipulated backend-side |
+| `customer_tags` | assignments are manipulated backend-side |
+
+They appear in the response under `not_checked`, so `complete: true` cannot be misread as
+"everything was verified".
+
+### Edge cases
+
+| # | Risk | Handling |
+|---|---|---|
+| 1 | ~3 min silver lag at the cutover boundary | Overlap the window ~5 min both ends |
+| 2 | **Stage 1 never inserts** | Rows created during the outage need stage 2 — step 6 |
+| 3 | Recency gate suppressing real changes | Read `suppressed_by_updated_at` per table first; on account 2367 it was 353 vs 40 on customers |
+| 4 | Historical `end` staging a superseded value | Fixed — the window picks keys, not values |
+| 5 | Row created *and* deleted inside the window | Latest row wins (carrying `deleted_at`); reconcile counts it under `missing_but_deleted`, not `missing` |
+| 6 | `is_valid` / deferred-payment placeholders | Silver has neither; those `order_lines` cannot be filtered in the bulk path |
+| 7 | Duplicate parent rows | Stage 2 refuses the account — run its verify across the list first |
+| 8 | Account inactive in RDS but live in the CRM | Skipped, but named in `rejected` — read that list |
+| 9 | Scale: 2–3 h × all accounts vs 54 s for one | 900 s ceiling. Use `run_stale: false` and move the stale pass into the Map if `load_elapsed_seconds` climbs |
 
 ---
 

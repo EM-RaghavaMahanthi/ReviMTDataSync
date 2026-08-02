@@ -11,6 +11,8 @@ One action per invocation; the Step Function sequences them:
                 load all 13 tables, run update_stale, return the account_ids for the Map
   update_stale  stale update only — for one account or a list. Lets the Step Function
                 move the stale pass into the Map if `stage` starts running long
+  reconcile     read-only: prove every staged row reached the target. Run after
+                promotion and BEFORE cleanup, which drops the staging it compares against
   cleanup       drop the staging tables, release the run slot
   verify        assert the target tables are reachable and Athena is configured
 
@@ -33,6 +35,7 @@ Event:
   {"action": "stage", "delta_minutes": 90}               window = (now-90m, now]
   {"action": "stage", "account_ids": [1410], "run_stale": false, "force": true}
   {"action": "update_stale", "account_id": 1410}         dry run
+  {"action": "reconcile"}                                for everything staged
   {"action": "cleanup"}
 
 Environment variables — see core/bulk_config.py. The load needs DATABASE_URL, REGION,
@@ -275,6 +278,36 @@ def _update_stale(event: dict, engine) -> dict:
     }
 
 
+def _reconcile(event: dict, engine) -> dict:
+    """
+    Did every row Silver held for the window reach the target?
+
+    Read-only. Run after `stage` and after promotion, but before `cleanup` — it compares
+    the staging tables against the target, and cleanup drops staging.
+    """
+    requested = [int(a) for a in (event.get("account_ids") or [])]
+    if event.get("account_id") is not None:
+        requested.append(int(event["account_id"]))
+
+    account_ids = requested or staging.staged_account_ids(engine)
+    if not account_ids:
+        return {
+            "status": "success", "action": "reconcile",
+            "result": {"complete": True, "note": "nothing staged"},
+        }
+
+    result = staging.reconcile(engine, account_ids, sample=int(event.get("sample", 5)))
+
+    # A shortfall is reported, not raised: the operator decides whether it is explained
+    # (a promote that has not run yet) or a real miss. Raising here would also make the
+    # Step Function retry a read-only check.
+    return {
+        "status": "success" if result["complete"] else "incomplete",
+        "action": "reconcile",
+        "result": result,
+    }
+
+
 def _cleanup(event: dict, engine) -> dict:
     dropped = staging.drop_staging_tables(engine)
     staging.release_run_slot(engine)
@@ -285,6 +318,7 @@ _ACTIONS = {
     "stage": _stage,
     "update_stale": _update_stale,
     "cleanup": _cleanup,
+    "reconcile": _reconcile,
     "verify": _verify,
 }
 
