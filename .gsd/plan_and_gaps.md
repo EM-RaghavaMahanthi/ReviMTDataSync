@@ -18,16 +18,29 @@ generalised to bulk accounts) and is not assessed here.
 | G7 | The standalone `update_stale` action goes through the same `resolve_accounts` path. | [handlers](../handlers/s3_to_stg_bulk.py) |
 | — | `dry_run` → **`update`** (default `False` = dry run), matching `db_services/update_stale`. Deployed with `BULK_UPDATE=false`, so the stale pass writes nothing until an event sets `"update": true`. | throughout |
 | — | **No upper bound on the value fetch.** The window picks *which keys* changed; each key's current version is then read unbounded above, so a historical catch-up cannot stage a superseded value (and cannot lock the correction out via `updated_at = now()`). | [staging.py](../s3_to_stg_bulk/staging.py) |
-| — | **`reconcile` action** — proves every staged row reached the target, naming sample keys for anything missing. Covers the 9 transactional tables; the 4 RDS-owned ones are reported as `not_checked`. | [staging.py](../s3_to_stg_bulk/staging.py), [handlers](../handlers/s3_to_stg_bulk.py) |
+| — | **`reconcile` action** — answers "is RDS caught up with Silver?". Same inputs as `stage` minus `end_datetime`; loads its own copy of the window and LEFT JOINs it against the target, naming sample keys for anything missing. Self-contained: no prior run, no run slot, no ordering constraint. Covers the 9 tables; the 4 RDS-owned ones are reported as `not_checked`. | [staging.py](../s3_to_stg_bulk/staging.py), [handlers](../handlers/s3_to_stg_bulk.py) |
 
 Staging table names stay `stg_*_bulk` — existing convention kept, no rename.
 
-**Verified statically** (no DB/AWS access): all four repair statements and all 18 count/update
-statements render; parens balance; no scalar `:account_id` survives; every SET column is staged,
-non-frozen and has a Silver source; every NOT NULL column is `COALESCE`-guarded on both sides; the
-recency gate picks `silver_inserted_at` only where `updated_at` has no Silver source; the
-ref/frozen-key invariant holds in both directions. ASL still parses; all changed modules compile.
-**Nothing has been executed against a database.**
+**Verified statically**: all four repair statements and all 18 count/update statements render;
+parens balance; no scalar `:account_id` survives; every SET column is staged, non-frozen and has a
+Silver source; every NOT NULL column is `COALESCE`-guarded on both sides; the recency gate picks
+`silver_inserted_at` only where `updated_at` has no Silver source; the ref/frozen-key invariant
+holds in both directions.
+
+**Verified live** against Silver and the production RDS. The function is deployed as
+`revi-bulk-s3-to-stg` on `revi-dlk-gold-lambda-exec`. All nine generated queries run; a dry-run
+stage on account 2367 loads 2672 rows in ~40 s; reconcile runs standalone with no prior stage.
+**No production row has been written** — every run so far has been `update: false`, and reconcile
+is read-only.
+
+Still unexercised, and worth knowing before a real rollover:
+
+- **`update: true` has never run.** `_update`, `_with_fallback` and the four ref repairs have
+  never executed against the database.
+- **One account at a time.** Never run with `account_ids` omitted, so the 900 s ceiling is
+  untested at "all accounts × 2–3 h".
+- **Stage 2 has never run at all** — and it is the half that inserts.
 
 ---
 
@@ -494,19 +507,21 @@ value. A gap is not recoverable.
 5. Re-run with `"update": true`.
 6. **Promote** — stage 2 (`stg_to_main_bulk`). Stage 1 only UPDATEs; every entity *created*
    during the outage needs this or it is silently lost.
-7. **Reconcile**, before cleanup:
+7. `{"action":"cleanup"}`.
+8. **Reconcile** — order does not matter, it loads its own copy:
    ```bash
    aws lambda invoke --function-name revi-bulk-s3-to-stg --cli-binary-format raw-in-base64-out \
-     --payload '{"action":"reconcile"}' /tmp/rec.json
+     --payload '{"action":"reconcile","start_datetime":"<outage_start − 5min>"}' /tmp/rec.json
    ```
-   Expect `complete: true`. Anything in `missing` comes with sample business keys.
-8. `{"action":"cleanup"}`.
+   Expect `complete: true`. Anything in `missing` comes with sample business keys. Re-run it
+   as often as you like — it is read-only against production and needs nothing left over
+   from the earlier steps.
 
 ### What reconcile does and does not cover
 
-Nine transactional tables are checked. Four are in `cfg.RECONCILE_SKIP` because RDS stays
-their system of record after the migration — a row missing there is expected, not a lost
-event:
+Nine tables are checked — the same nine the pipeline moves. Four are in `cfg.RDS_OWNED`
+and are not staged, stale-updated or reconciled at all, because RDS stays their system of
+record after the migration:
 
 | skipped | why |
 |---|---|
@@ -563,8 +578,42 @@ still applies to `stg_to_main_bulk`.
 
 ## Still open
 
-Nothing for lambda 1. What remains is second-lambda work:
+### Stage 2 — `stg_to_main_bulk`
 
+Static review is part-done. Confirmed so far: the file mapping is 1:1 against
+`stg_db_services`, the transformation is mechanical (drop `location_id` from the signature,
+rename the staging table, remove the location predicates), and `_base/dedup.py` is correctly
+account-scoped in both its count and its DELETE.
+
+**One confirmed bug.** `class_sessions` and `membership_instances` call
+`step_1_count_staging_total(account_id, engine)`, which runs `SELECT COUNT(*) FROM
+stg_<t>_bulk` with **no WHERE** — the parameter is accepted and ignored. That was correct when
+staging held one account; it now holds all of them, and the count feeds a strict validation:
+
+```python
+expected_ready = total_staging - already_exist_in_main   # all accounts − this account
+if ready_to_insert != expected_ready: raise
+```
+
+So both raise for every account as soon as more than one is staged. Both are in the nine.
+(`customers` has the same bug but is now out of scope.) The other 75 staging counts across the
+processors are correctly scoped.
+
+Not yet reviewed: the credit/membership split, the duplicate-parent guard, the
+overlapping-subtraction hazard in [review.md](review.md) #5, and cross-stage consistency with
+the frozen keys and `is_valid`.
+
+### Other
+
+- The Step Function is not deployable: `${STAGE_LAMBDA_ARN}` / `${PROMOTE_LAMBDA_ARN}` are still
+  placeholders, it has no `reconcile` state, and its `vacuum`/`promote` states target a function
+  that does not exist yet. Being written last, once stage 2 is done.
+- `deploy_stg_to_main_bulk.sh` is still the old update-only shape — no create, no role, no
+  layers, no VPC. It will fail exactly the way stage 1's did.
+- **The Lake Formation grants live only in the AWS account.** `revi-dlk-gold-lambda-exec` was
+  granted `DESCRIBE` on the `silver` database and on both catalog levels by hand. If the role is
+  ever rebuilt from terraform they vanish and Athena returns `CATALOG_NOT_FOUND`. They belong in
+  whatever manages that role.
 - `stg_to_main_bulk` hardcodes the `stg_*_bulk` names as 176 string literals across 22 files rather
   than calling `cfg.staging_name()`. Not urgent now the rename is off the table, but it lets the two
   lambdas drift apart silently.
