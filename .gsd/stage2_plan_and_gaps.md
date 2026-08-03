@@ -1,5 +1,11 @@
 # Lambda 2 — `stg_to_main_bulk`: what it is, and what has to change
 
+> **Superseded in approach by [stage2_rewrite_plan.md](stage2_rewrite_plan.md).** The gaps
+> below are all accurate, but they are symptoms of one cause — this is the onboarding
+> pipeline with `location_id` deleted, so it is still per-account. Rewriting to a single
+> account-independent shape removes gaps 1, 2 and 3 outright. Keep this doc for the
+> findings; follow that one for the work.
+
 Companion to [plan_and_gaps.md](plan_and_gaps.md), which covers Lambda 1. Nothing here has
 been executed — `revi-bulk-stg-to-main` does not exist as a function yet, and the backend is
 live, so this is a static review only.
