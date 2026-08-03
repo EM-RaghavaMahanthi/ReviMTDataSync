@@ -582,7 +582,11 @@ still applies to `stg_to_main_bulk`.
 
 ### Stage 2 — `stg_to_main_bulk`
 
-Static review is part-done. Confirmed so far: the file mapping is 1:1 against
+Reviewed in full — see **[stage2_plan_and_gaps.md](stage2_plan_and_gaps.md)**. Headline: three
+of the twelve processors read staging tables stage 1 no longer creates, and `customers_01` is
+first in the order, so `promote` fails on its opening query.
+
+Confirmed sound: the file mapping is 1:1 against
 `stg_db_services`, the transformation is mechanical (drop `location_id` from the signature,
 rename the staging table, remove the location predicates), and `_base/dedup.py` is correctly
 account-scoped in both its count and its DELETE.
@@ -601,9 +605,10 @@ So both raise for every account as soon as more than one is staged. Both are in 
 (`customers` has the same bug but is now out of scope.) The other 75 staging counts across the
 processors are correctly scoped.
 
-Not yet reviewed: the credit/membership split, the duplicate-parent guard, the
-overlapping-subtraction hazard in [review.md](review.md) #5, and cross-stage consistency with
-the frozen keys and `is_valid`.
+The overlapping-subtraction hazard in [review.md](review.md) #5 is confirmed, not just
+theoretical: `credit_transactions` subtracts "customer missing" and "already exists" as if
+disjoint, and a row that is both gets subtracted twice, raising on healthy data. Full list in
+the stage 2 doc.
 
 ### Other
 
