@@ -101,10 +101,15 @@ fixes. Gap 7 (176 hardcoded staging names) is worth doing in the same pass — d
 
 ---
 
-## Duplicate parents — fix the join, do not choose how to fail
+## Duplicate parents — one gate, fail the whole run
 
-The problem, concretely. Every child insert resolves its parent by joining on the business
-key:
+`(account_id, <business key>)` is unique by policy, and there is a script that deletes
+duplicates and repairs any `*_ref_id` left pointing at the removed row. So a duplicate is
+not a condition to tolerate — it is an invariant violation, and the right response is to
+stop.
+
+Why it matters if one slips through: every child insert resolves its parent with an
+`INNER JOIN` on the business key —
 
 ```sql
 INSERT INTO public.orders (..., customer_ref_id)
@@ -113,31 +118,26 @@ FROM stg_orders_bulk stg
 INNER JOIN customers c ON stg.customer_id = c.customer_id AND c.account_id = stg.account_id
 ```
 
-The onboarding pipeline scopes its "does this customer exist" check per **location**, so it
-can create two `customers` rows for one `customer_id` under two locations of one account.
-When that happens this join returns two rows for one staging row, and the order is inserted
-**twice**. `_check_duplicate_parents` exists to detect that and refuse the account.
+— so two parent rows for one key return two rows for one staging row, and the order is
+inserted **twice**.
 
-Reconcile confirmed the duplicates are real — 10 rows in a 60-account window.
+**Therefore:**
 
-Refusing is the wrong answer for an account-independent run: one duplicate anywhere would
-block all 60 accounts. Make the lookup return exactly one parent instead:
+- `_check_duplicate_parents` stays a **hard gate**, not a report.
+- It runs **once, account-independent, before any insert** — one query per parent table
+  instead of one per table per account.
+- **Any duplicate, in any account, fails the whole run before a single row is written.**
+  Confirmed as wanted: a clean stop is easier to reason about than a partial promote across
+  sixty accounts, and the remedy is one script run away.
 
-```sql
-INNER JOIN (
-  SELECT DISTINCT ON (account_id, customer_id) id, account_id, customer_id
-  FROM customers
-  ORDER BY account_id, customer_id, id      -- lowest id wins, deterministic
-) c ON c.customer_id = stg.customer_id AND c.account_id = stg.account_id
-```
+No `DISTINCT ON` in the parent lookups. The joins stay plain `INNER JOIN`s — simpler, and
+correct given the uniqueness guarantee. Tolerating duplicates in the join would only hide
+the violation the gate exists to surface.
 
-One row per `(account_id, business key)` by construction, so the fan-out cannot happen and
-nothing needs refusing. This is the alternative [review.md](review.md) #1 already suggests.
-
-Apply it to every parent lookup in the 13 inserts. `_check_duplicate_parents` then stops
-being a gate and becomes a **report** — still worth running and surfacing, because duplicate
-parents are a real data problem someone should fix backend-side, but no longer something
-that blocks a promote.
+Worth considering separately: a unique index on `(account_id, <business key>)` for each
+parent table would let the database enforce what the script maintains, so the gate becomes
+a belt-and-braces check rather than the only thing standing between a duplicate and a
+double insert.
 
 ## Dry run
 
@@ -153,12 +153,14 @@ wins, then an env var, then false.
 
 ## Order of work
 
-1. Generic runner + the 6-number report; one table end to end (`class_sessions` — no deps).
-2. Port the other 12 inserts into it, in dependency order.
-3. Drop the account predicate from the first_timer recalc; delete the pandas step and
+1. Duplicate-parent gate first — account-independent, one query per parent table, fails the
+   run before anything is written.
+2. Generic runner + the 6-number report; one table end to end (`class_sessions` — no deps).
+3. Port the other 12 inserts into it, in dependency order.
+4. Drop the account predicate from the first_timer recalc; delete the pandas step and
    `_update_customer_class_dates`.
-4. Trim `PROCESSING_ORDER`, derive it from `cfg.STAGING_ORDER`.
-5. Rewrite `deploy_stg_to_main_bulk.sh` the way stage 1's was — create-if-missing, clone
+5. Trim `PROCESSING_ORDER`, derive it from `cfg.STAGING_ORDER`.
+6. Rewrite `deploy_stg_to_main_bulk.sh` the way stage 1's was — create-if-missing, clone
    layers/VPC, `revi-dlk-gold-lambda-exec`, and `--role` on update as well as create.
-6. `insert: false` against one account, then all; then the real thing.
-7. Step Function last, once both functions exist and have ARNs.
+7. `insert: false` against one account, then all; then the real thing.
+8. Step Function last, once both functions exist and have ARNs.
