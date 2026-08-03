@@ -21,7 +21,10 @@ BUILD_DIR="stg_to_main_bulk_build"
 # clients/, utils/ and schemas/ are needed only by the optional post-processing step
 # (IS_POST_PROCESS), which is off by default for bulk — shipped anyway so enabling the
 # flag does not require a different package.
-SOURCE_DIRS=("core" "clients" "handlers" "stg_to_main_bulk" "utils" "schemas")
+# s3_to_stg_bulk is packaged for its config only: stage 2 derives the staging table
+# names and the processing order from cfg rather than repeating them, so a change to
+# stage 1's table set cannot silently orphan a processor here.
+SOURCE_DIRS=("core" "clients" "handlers" "stg_to_main_bulk" "s3_to_stg_bulk" "utils" "schemas")
 
 info()    { echo "[INFO]  $*"; }
 success() { echo "[OK]    $*"; }

@@ -1,25 +1,31 @@
 """
-Bulk Stage 2 — staging → production tables, one account per invocation.
+Bulk Stage 2 — staging → production tables, every staged account in one invocation.
 
-The delta counterpart to handlers/stg_to_db.py. Same twelve processors in the same strict
-dependency order, but every query is account-scoped only: the bulk staging tables are
-unique on (account_id, business key), so one pass covers all of an account's locations.
+Stage 1 loads Silver into staging and UPDATEs what already exists; this is the other half,
+and it INSERTs what does not. Between them they cover the two shortfalls `reconcile`
+reports: `differing` for stage 1, `missing` here.
+
+Account-independent, like stage 1. Staging is unique on (account_id, business key), so one
+pass covers every account and every location. Table order is the dependency order and is
+strict — each insert resolves its parent's `*_ref_id` by joining the parent's target table,
+so parents must land first.
 
 One action per invocation; the Step Function sequences them:
 
-  vacuum   VACUUM ANALYZE the target tables once, before the Map fans out. The
-           onboarding pipeline vacuums inside each account's run; at Map concurrency that
-           would mean several concurrent VACUUMs over the same tables.
-  promote  (default) run the twelve processors for one account, then recompute that
-           account's customer class dates
-  verify   duplicate-parent pre-flight for one account (or all promotable accounts),
-           writes nothing
+  vacuum   VACUUM ANALYZE the target tables once, before the inserts.
+  promote  (default) run the processors for every staged account. `account_ids` narrows it.
+           A duplicate parent anywhere fails the run before a single row is written.
+  verify   duplicate-parent pre-flight, writes nothing. Run it before a promote.
 
 Event:
-  {"action": "promote", "account_id": 1410}
-  {"action": "promote", "account_id": 1410, "allow_duplicate_parents": true}
+  {"action": "promote"}                                  everything staged
+  {"action": "promote", "account_ids": [1410, 1411]}     narrowed
+  {"action": "promote", "allow_duplicate_parents": true} override the gate
   {"action": "vacuum"}
-  {"action": "verify", "account_id": 1410}
+  {"action": "verify"}
+
+Class dates are not recomputed here — a separate script owns them for all accounts, and
+`customers` is cfg.RDS_OWNED, so neither bulk lambda writes to it.
 
 Environment variables — see core/bulk_config.py.
 """
@@ -34,6 +40,7 @@ from sqlalchemy import create_engine, text
 
 from core.bulk_config import settings
 from core.logger import setup_logging
+from s3_to_stg_bulk import config as cfg
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -94,158 +101,73 @@ def _engine():
 
 # ── Duplicate-parent pre-flight ─────────────────────────────────────────────
 
-def _check_duplicate_parents(engine, account_id) -> dict:
+def _check_duplicate_parents(engine, account_ids: list = None, sample: int = 5) -> dict:
     """
     Find parent tables holding more than one row for the same (account_id, business key).
 
-    The onboarding pipeline scopes every join and every "already exists" check to one
-    location, so it can (and historically does) create two rows for the same customer_id
-    under two locations of one account. The bulk pipeline drops the location predicate —
-    which stops NEW duplicates being created, but means an INNER JOIN onto a
-    pre-existing duplicate pair fans out and inserts the child row twice.
+    `(account_id, business key)` is unique by policy, maintained by a script that deletes
+    duplicates and repairs any *_ref_id left pointing at the removed row. So a hit here is
+    an invariant violation, not a condition to work around — see the caller, which fails
+    the whole run rather than skipping the account.
 
-    Reported per table so a promote can refuse rather than silently double-insert.
+    It matters because every child insert resolves its parent with an INNER JOIN on the
+    business key. Two parent rows for one key return two rows for one staging row, and the
+    child is inserted twice. The onboarding pipeline can create such pairs: it scopes its
+    "already exists" check per location, so one customer_id can end up with a row under
+    each of an account's locations.
+
+    Account-independent: one query per parent table for the whole run, not one per table
+    per account. `account_ids` narrows it when given; omit it to check everything.
+    Offending accounts are named so the dedup script has somewhere to start.
     """
     findings = {}
+    scope = "AND account_id = ANY(:ids)" if account_ids else ""
+    params = {"ids": account_ids} if account_ids else {}
+
     with engine.connect() as conn:
         for table, key_col in PARENT_KEYS:
             row = conn.execute(text(f"""
                 SELECT COUNT(*) AS dup_keys, COALESCE(SUM(n) - COUNT(*), 0) AS extra_rows
                 FROM (
-                  SELECT {key_col}, COUNT(*) AS n
+                  SELECT account_id, {key_col}, COUNT(*) AS n
                   FROM {table}
-                  WHERE account_id = :account_id
-                    AND {key_col} IS NOT NULL
-                  GROUP BY {key_col}
+                  WHERE {key_col} IS NOT NULL {scope}
+                  GROUP BY account_id, {key_col}
                   HAVING COUNT(*) > 1
                 ) d
-            """), {"account_id": account_id}).fetchone()
+            """), params).fetchone()
 
             if row and int(row[0]) > 0:
+                offenders = [
+                    {"account_id": int(r[0]), key_col: r[1], "rows": int(r[2])}
+                    for r in conn.execute(text(f"""
+                        SELECT account_id, {key_col}, COUNT(*) AS n
+                        FROM {table}
+                        WHERE {key_col} IS NOT NULL {scope}
+                        GROUP BY account_id, {key_col}
+                        HAVING COUNT(*) > 1
+                        ORDER BY COUNT(*) DESC
+                        LIMIT {int(sample)}
+                    """), params).fetchall()
+                ]
                 findings[table] = {
                     "duplicate_keys": int(row[0]),
                     "extra_rows": int(row[1]),
                     "key_column": key_col,
+                    "sample": offenders,
                 }
+                logger.error(
+                    f"[duplicate_parents] {table}: {row[0]} duplicated "
+                    f"{key_col} values, {row[1]} extra rows"
+                )
 
     return findings
 
 
-# ── Class dates ─────────────────────────────────────────────────────────────
+# Class dates are NOT recomputed here. A separate script updates last_class_date /
+# next_class_date for every account at once and is the authority for them; customers is
+# cfg.RDS_OWNED, so neither bulk lambda writes to that table at all.
 
-def _update_customer_class_dates(engine, account_id, update: bool = True) -> dict:
-    """
-    Recompute last_class_date / next_class_date from the account's promoted reservations.
-
-    Unchanged from handlers/stg_to_db.py — it was already account-scoped with no location
-    predicate. This, not Silver, is the authority for these two columns: s3_to_stg_bulk
-    lists them in the customers spec's `no_update` set precisely so the stale update does
-    not fight this pass.
-    """
-    count_sql = text("""
-        WITH last_class AS (
-            SELECT
-                r.customer_ref_id,
-                MAX(r.check_in_date) AS last_class_date
-            FROM reservations r
-            WHERE r.account_id    = :account_id
-              AND r.status        = 'check in'
-              AND r.deleted_at    IS NULL
-              AND r.check_in_date IS NOT NULL
-            GROUP BY r.customer_ref_id
-        ),
-        next_class AS (
-            SELECT DISTINCT ON (r.customer_ref_id)
-                r.customer_ref_id,
-                cs.start_datetime AS next_class_date
-            FROM reservations r
-            INNER JOIN class_sessions cs
-                ON cs.id          = r.class_session_ref_id
-               AND cs.deleted_at  IS NULL
-            WHERE r.account_id = :account_id
-              AND r.status     = 'pending'
-              AND r.deleted_at IS NULL
-              AND cs.start_datetime > NOW()
-            ORDER BY r.customer_ref_id, cs.start_datetime ASC
-        )
-        SELECT COUNT(*) FROM customers c
-        LEFT JOIN last_class lc ON lc.customer_ref_id = c.id
-        LEFT JOIN next_class nc ON nc.customer_ref_id = c.id
-        WHERE c.account_id = :account_id
-          AND (
-            c.last_class_date IS DISTINCT FROM lc.last_class_date
-            OR
-            c.next_class_date IS DISTINCT FROM nc.next_class_date
-          )
-    """)
-
-    update_sql = text("""
-        WITH last_class AS (
-            SELECT
-                r.customer_ref_id,
-                MAX(r.check_in_date) AS last_class_date
-            FROM reservations r
-            WHERE r.account_id    = :account_id
-              AND r.status        = 'check in'
-              AND r.deleted_at    IS NULL
-              AND r.check_in_date IS NOT NULL
-            GROUP BY r.customer_ref_id
-        ),
-        next_class AS (
-            SELECT DISTINCT ON (r.customer_ref_id)
-                r.customer_ref_id,
-                cs.start_datetime AS next_class_date
-            FROM reservations r
-            INNER JOIN class_sessions cs
-                ON cs.id          = r.class_session_ref_id
-               AND cs.deleted_at  IS NULL
-            WHERE r.account_id = :account_id
-              AND r.status     = 'pending'
-              AND r.deleted_at IS NULL
-              AND cs.start_datetime > NOW()
-            ORDER BY r.customer_ref_id, cs.start_datetime ASC
-        )
-        UPDATE customers c
-        SET
-            last_class_date = lc.last_class_date,
-            next_class_date = nc.next_class_date,
-            updated_at      = NOW(),
-            updated_by      = -1
-        FROM
-            (SELECT id FROM customers WHERE account_id = :account_id) target
-        LEFT JOIN last_class lc ON lc.customer_ref_id = target.id
-        LEFT JOIN next_class nc ON nc.customer_ref_id = target.id
-        WHERE c.id = target.id
-          AND (
-            c.last_class_date IS DISTINCT FROM lc.last_class_date
-            OR
-            c.next_class_date IS DISTINCT FROM nc.next_class_date
-          )
-    """)
-
-    with engine.begin() as conn:
-        expected = conn.execute(count_sql, {"account_id": account_id}).scalar()
-
-    logger.info(f"[class_dates] expected to update: {expected} customers for account_id={account_id}")
-
-    if not update:
-        return {"expected": expected, "updated": None, "match": None}
-
-    with engine.begin() as conn:
-        updated = conn.execute(update_sql, {"account_id": account_id}).rowcount
-
-    match = updated == expected
-    if match:
-        logger.info(f"[class_dates] updated {updated} customers — count matches expected")
-    else:
-        diff_pct = abs(expected - updated) / expected * 100 if expected else 100
-        level = logger.warning if diff_pct < 1 else logger.error
-        level(f"[class_dates] count mismatch ({diff_pct:.2f}%) — expected {expected}, updated {updated}")
-
-    return {"expected": expected, "updated": updated, "match": match}
-
-
-# ── Post-processing ─────────────────────────────────────────────────────────
 
 async def post_processing_step(account_id: int, is_post_process: bool) -> bool:
     """
@@ -301,105 +223,162 @@ def _vacuum(event: dict, engine) -> dict:
 
 
 def _verify(event: dict, engine) -> dict:
-    account_id = event.get("account_id")
-    if account_id is None:
-        raise ValueError("verify requires account_id")
+    """
+    Read-only: would a promote be blocked right now?
 
-    duplicates = _check_duplicate_parents(engine, int(account_id))
+    `account_ids` narrows the check; omit it to cover every account, which is the same
+    scope `promote` uses. Reports rather than raises — it exists to be run before a
+    promote, so an operator can hand the offenders to the dedup script.
+    """
+    account_ids = [int(a) for a in (event.get("account_ids") or [])]
+    if event.get("account_id") is not None:
+        account_ids.append(int(event["account_id"]))
+
+    duplicates = _check_duplicate_parents(engine, account_ids or None)
     return {
-        "status": "success" if not duplicates else "error",
+        "status": "success" if not duplicates else "blocked",
         "action": "verify",
-        "account_id": int(account_id),
+        "account_ids": account_ids or "all",
         "duplicate_parents": duplicates,
+        "promote_would_run": not duplicates,
     }
 
 
+def _staged_account_ids(engine) -> list:
+    """
+    Every account with rows in staging. Derived from cfg.STAGING_ORDER rather than a
+    hardcoded list, so it follows stage 1's table set automatically.
+    """
+    parts = [
+        f'SELECT DISTINCT account_id FROM "{cfg.staging_name(t)}"'
+        for t in cfg.STAGING_ORDER
+    ]
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT account_id FROM (" + " UNION ".join(parts) + ") u "
+            "WHERE account_id IS NOT NULL ORDER BY account_id"
+        )).fetchall()
+    return [int(r[0]) for r in rows]
+
+
 async def _promote(event: dict, engine) -> dict:
-    account_id = event.get("account_id")
-    if account_id is None:
-        raise ValueError("promote requires account_id")
-    account_id = int(account_id)
+    # Account-independent by default: promote covers whatever stage 1 staged. `account_ids`
+    # narrows it; the old single `account_id` is still accepted so a Map branch or a manual
+    # one-account run keeps working.
+    account_ids = [int(a) for a in (event.get("account_ids") or [])]
+    if event.get("account_id") is not None:
+        account_ids.append(int(event["account_id"]))
+    if not account_ids:
+        account_ids = _staged_account_ids(engine)
+    if not account_ids:
+        return {
+            "status": "success", "action": "promote", "account_ids": [],
+            "summary": {"note": "nothing staged"},
+        }
 
     start_time = time.time()
-    logger.info(f"stg_to_main_bulk starting — account_id={account_id}")
+    logger.info(f"stg_to_main_bulk starting — {len(account_ids)} accounts")
 
-    duplicates = _check_duplicate_parents(engine, account_id)
+    # One gate for the whole run, before a single row is written. (account_id, business key)
+    # is unique by policy and a script maintains it, so a hit here is an invariant
+    # violation: fail everything rather than promote some accounts and skip others. A
+    # partial promote across sixty accounts is far harder to reason about than a clean stop,
+    # and the remedy is one script run away.
+    duplicates = _check_duplicate_parents(engine, account_ids)
     if duplicates and not event.get("allow_duplicate_parents", False):
-        # Refusing beats double-inserting: the joins below would fan out one child row per
-        # duplicate parent. Deduplicate the parent rows, or re-invoke with
-        # {"allow_duplicate_parents": true} if the fan-out is understood and acceptable.
         raise RuntimeError(
-            f"account {account_id} has duplicate parent business keys "
-            f"{json.dumps(duplicates)} — location-free joins would fan out. "
-            f'Pass {{"allow_duplicate_parents": true}} to promote anyway.'
+            f"duplicate parent business keys found — the FK joins would fan out and insert "
+            f"child rows twice. Nothing was written. Run the dedup script, then re-run. "
+            f'Override with {{"allow_duplicate_parents": true}} only if the fan-out is '
+            f"understood and acceptable. Findings: {json.dumps(duplicates)}"
         )
 
     successful_tables = []
     failed_tables = []
     total_processed = 0
 
+    # Scaffolding until step 3 makes the processors account-independent. The gate above
+    # already runs once for the whole set; the processors still take one account, so they
+    # are looped per table. Table order is the dependency order and must be preserved, so
+    # tables are the outer loop — every account gets its parents before any child.
+    #
+    # A failure stops the whole run, not just that account: the tables after this one
+    # depend on it, so continuing would insert children whose parents are missing. Same
+    # strictness the per-account version had, applied to the whole set.
     for table_name, process_func in PROCESSING_ORDER:
-        t0 = time.time()
-        try:
-            logger.info(f"[{table_name}] starting...")
-            result = await process_func(account_id, engine)
-            inserted = result.get("inserted_records", 0) if isinstance(result, dict) else result
-            elapsed = round(time.time() - t0, 2)
-            logger.info(f"[{table_name}] done — {inserted} inserted in {elapsed}s")
-            successful_tables.append({
-                "table": table_name, "status": "success",
-                "inserted_records": inserted, "elapsed_seconds": elapsed,
-            })
-            total_processed += inserted
-        except Exception as e:
-            elapsed = round(time.time() - t0, 2)
-            logger.error(f"[{table_name}] failed in {elapsed}s: {e} — stopping pipeline")
+        t_table = time.time()
+        table_inserted = 0
+        failed = None
+
+        for account_id in account_ids:
+            try:
+                result = await process_func(account_id, engine)
+                table_inserted += (
+                    result.get("inserted_records", 0) if isinstance(result, dict) else result
+                )
+            except Exception as e:
+                logger.error(f"[{table_name}] account={account_id} failed: {e}")
+                failed = {"account_id": account_id, "error": str(e)}
+                break
+
+        elapsed = round(time.time() - t_table, 2)
+        if failed:
             failed_tables.append({
                 "table": table_name, "status": "failed",
-                "error": str(e), "elapsed_seconds": elapsed,
+                "error": failed["error"], "account_id": failed["account_id"],
+                "inserted_before_failure": table_inserted, "elapsed_seconds": elapsed,
             })
+            logger.error(f"[{table_name}] failed in {elapsed}s — stopping pipeline")
             break
+
+        logger.info(
+            f"[{table_name}] done — {table_inserted} inserted across "
+            f"{len(account_ids)} accounts in {elapsed}s"
+        )
+        successful_tables.append({
+            "table": table_name, "status": "success",
+            "inserted_records": table_inserted, "elapsed_seconds": elapsed,
+        })
+        total_processed += table_inserted
 
     total_duration = round(time.time() - start_time, 2)
     total_tables = len(PROCESSING_ORDER)
     success_count = len(successful_tables)
 
     logger.info(
-        f"stg_to_main_bulk done — account_id={account_id}, "
+        f"stg_to_main_bulk done — {len(account_ids)} accounts, "
         f"{success_count}/{total_tables} tables, {total_processed} records, {total_duration}s"
     )
 
     if failed_tables:
-        # Fail so Step Functions retries this account's Map branch, then routes to a Fail
-        # state (redrive). Other accounts' branches are unaffected.
+        # Fail the invocation so Step Functions retries, then routes to a Fail state
+        # (redrive). Tables after the failed one depend on it, so nothing further ran.
         raise Exception(
             f"stg_to_main_bulk: {len(failed_tables)}/{total_tables} tables failed "
-            f"for account {account_id}: {failed_tables}"
+            f"across {len(account_ids)} accounts: {failed_tables}"
         )
 
-    try:
-        class_dates = _update_customer_class_dates(engine, account_id, update=True)
-    except Exception as e:
-        logger.error(f"[class_dates] failed for account_id={account_id}: {e}")
-        class_dates = {"expected": None, "updated": None, "match": None}
-
-    post_ok = await post_processing_step(account_id, settings.IS_POST_PROCESS)
-    if not post_ok:
-        raise Exception("stg_to_main_bulk: all tables succeeded but post-processing failed")
+    # Account-scoped and off by default for bulk (IS_POST_PROCESS=false) — the EZTexting
+    # sync is an onboarding concern. Kept per account rather than dropped, so turning the
+    # flag on still behaves the way it did.
+    for account_id in account_ids:
+        if not await post_processing_step(account_id, settings.IS_POST_PROCESS):
+            raise Exception(
+                f"stg_to_main_bulk: all tables succeeded but post-processing failed "
+                f"for account {account_id}"
+            )
 
     return {
         "status": "success",
         "action": "promote",
-        "account_id": account_id,
+        "account_ids": account_ids,
         "duplicate_parents": duplicates,
         "summary": {
+            "accounts": len(account_ids),
             "total_tables": total_tables,
             "successful_tables": success_count,
             "failed_tables": 0,
             "total_records_inserted": total_processed,
-            "class_dates_expected": class_dates["expected"],
-            "class_dates_updated": class_dates["updated"],
-            "class_dates_match": class_dates["match"],
             "elapsed_seconds": total_duration,
         },
         "table_results": successful_tables,
