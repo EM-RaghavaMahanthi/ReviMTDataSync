@@ -64,25 +64,22 @@ the customer sync a few minutes.
 
 ---
 
-## Two post-passes, once, at the end
+## One post-pass, at the end
 
-Both are already single-SQL and already account-independent in shape — they only need
-`WHERE … account_id = :account_id` removed.
+**`first_timer`** — keep `step_3_recalculate_first_timer`, drop the account predicate so it
+runs once for everything. Delete `step_1_calculate_first_timer_field_with_pandas` entirely:
+it pulls staging into pandas to pre-set the flag "~99% correct at insert time", and the SQL
+recalculates all of it anyway. The recalc already picks the correct row per
+`(account_id, customer_id)` with `DISTINCT ON` and touches only rows where `first_timer IS
+DISTINCT FROM` the computed value — a small number. Deleting step 1 removes the pandas
+dependency and a batched 1000-row update loop.
 
-**`first_timer`** — drop `step_1_calculate_first_timer_field_with_pandas` entirely. It pulls
-staging into pandas to pre-set the flag "~99% correct at insert time", then
-`step_3_recalculate_first_timer` fixes the rest anyway. Insert without it and let the single
-SQL do all of it: it already computes the correct row per `(account_id, customer_id)` via
-`DISTINCT ON` and updates only rows where `first_timer IS DISTINCT FROM` the computed value —
-a small number. Deleting step 1 removes the pandas dependency and a batched 1000-row update
-loop.
+It reads `reservations` and `class_sessions`, so it runs after all 13 inserts.
 
-**`customer_class_dates`** — `_update_customer_class_dates` recomputes
-`last_class_date` / `next_class_date` from promoted reservations. Same treatment: drop the
-account predicate, run once.
-
-Order matters: both read `reservations` and `class_sessions`, so they run after all 13
-inserts.
+**`customer_class_dates` comes out.** `_update_customer_class_dates` is deleted, not
+generalised — there is already a script that updates class dates for every account at once,
+and that is the authority. This also settles the open question about stage 2 writing to
+`customers`: after this, neither lambda writes to that table at all.
 
 ---
 
@@ -104,18 +101,53 @@ fixes. Gap 7 (176 hardcoded staging names) is worth doing in the same pass — d
 
 ---
 
-## What still needs deciding
+## Duplicate parents — fix the join, do not choose how to fail
 
-1. **`_check_duplicate_parents`.** Reconcile found real duplicates in live data — 10 in a
-   60-account window. Account-independent promote means one duplicate anywhere would refuse
-   everything, which is too blunt. Options: report and skip the affected keys, or fail the
-   whole run. Skipping seems right, but it is a behaviour change.
-2. **Does `_update_customer_class_dates` stay at all?** It is the only write to `customers`
-   in either lambda, and RDS owns that table now.
-3. **A dry-run mode.** Stage 1 has `update: false`; stage 2 has nothing equivalent, so its
-   first execution inserts into production. The shape above makes this nearly free —
-   everything up to `inserted` is already read-only, so a `insert: false` flag stops before
-   the write and still reports `staged` / `present` / `missing`.
+The problem, concretely. Every child insert resolves its parent by joining on the business
+key:
+
+```sql
+INSERT INTO public.orders (..., customer_ref_id)
+SELECT stg.order_id, ..., c.id
+FROM stg_orders_bulk stg
+INNER JOIN customers c ON stg.customer_id = c.customer_id AND c.account_id = stg.account_id
+```
+
+The onboarding pipeline scopes its "does this customer exist" check per **location**, so it
+can create two `customers` rows for one `customer_id` under two locations of one account.
+When that happens this join returns two rows for one staging row, and the order is inserted
+**twice**. `_check_duplicate_parents` exists to detect that and refuse the account.
+
+Reconcile confirmed the duplicates are real — 10 rows in a 60-account window.
+
+Refusing is the wrong answer for an account-independent run: one duplicate anywhere would
+block all 60 accounts. Make the lookup return exactly one parent instead:
+
+```sql
+INNER JOIN (
+  SELECT DISTINCT ON (account_id, customer_id) id, account_id, customer_id
+  FROM customers
+  ORDER BY account_id, customer_id, id      -- lowest id wins, deterministic
+) c ON c.customer_id = stg.customer_id AND c.account_id = stg.account_id
+```
+
+One row per `(account_id, business key)` by construction, so the fan-out cannot happen and
+nothing needs refusing. This is the alternative [review.md](review.md) #1 already suggests.
+
+Apply it to every parent lookup in the 13 inserts. `_check_duplicate_parents` then stops
+being a gate and becomes a **report** — still worth running and surfacing, because duplicate
+parents are a real data problem someone should fix backend-side, but no longer something
+that blocks a promote.
+
+## Dry run
+
+`"insert": false` — confirmed wanted. Nearly free in this shape: everything up to `inserted`
+is already read-only, so the flag simply stops before the INSERT and still reports `staged`,
+`duplicates`, `present` and `missing`. `inserted` and `blocked` come back as `null` rather
+than `0`, so a dry run cannot be mistaken for a real one that inserted nothing.
+
+Default `false`, matching stage 1's `update` flag, with the same precedence: event field
+wins, then an env var, then false.
 
 ---
 
@@ -123,9 +155,10 @@ fixes. Gap 7 (176 hardcoded staging names) is worth doing in the same pass — d
 
 1. Generic runner + the 6-number report; one table end to end (`class_sessions` — no deps).
 2. Port the other 12 inserts into it, in dependency order.
-3. Drop the account predicate from the two post-passes; delete the pandas step.
+3. Drop the account predicate from the first_timer recalc; delete the pandas step and
+   `_update_customer_class_dates`.
 4. Trim `PROCESSING_ORDER`, derive it from `cfg.STAGING_ORDER`.
 5. Rewrite `deploy_stg_to_main_bulk.sh` the way stage 1's was — create-if-missing, clone
    layers/VPC, `revi-dlk-gold-lambda-exec`, and `--role` on update as well as create.
-6. Dry run against one account, then all.
+6. `insert: false` against one account, then all; then the real thing.
 7. Step Function last, once both functions exist and have ARNs.
