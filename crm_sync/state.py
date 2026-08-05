@@ -6,6 +6,7 @@ Each shard dict is a self-contained Lambda payload consumed by handlers/crm_to_s
   location_shard    {mode, resource, page_start, page_end, account_id, location_id, api_base_url}
   user_shard        {mode, resource, page_start, page_end, account_id, location_id, api_base_url}
   user_batch_shard  {mode, resource, user_offset, user_limit, account_id, location_id, api_base_url}
+  id_batch_shard    {mode, resource, id_offset, id_limit, account_id, location_id, api_base_url}
   tenant_shard      {mode, resource,                       account_id, location_id, api_base_url}
 
 The probe is a raw api_get (no field mapping) — we only need meta.pagination / links.last.
@@ -26,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 _PAGES_PER_SHARD = int(os.environ.get("PAGES_PER_SHARD", getattr(settings, "PAGES_PER_SHARD", 200)))
 _USER_BATCHES_PER_SHARD = int(os.environ.get("USER_BATCHES_PER_SHARD", getattr(settings, "USER_BATCHES_PER_SHARD", 200)))
+# Ids per shard, derived rather than configured: the same 200 requests per Lambda the page
+# and user shards already use, times the ids each request carries. One knob fewer, and it
+# tracks automatically if the request budget changes.
+_REQUESTS_PER_SHARD = _PAGES_PER_SHARD
 
 
 def _actual_last_page(resp: dict, reported: int) -> int:
@@ -147,4 +152,61 @@ async def plan_user_shards(
             shards.append({**base, "mode": "tenant_shard", "resource": resource})
 
     logger.info(f"[plan] {len(shards)} user/notes/tenant shards")
+    return shards
+
+
+async def plan_transaction_shards(
+    account_id, location_id, api_base_url, tables: list = None,
+) -> list:
+    """
+    Phase 2 of planning — shards for the "id_batch" resources.
+
+    Must run AFTER Stage1_LocationMap: the ids come from order_lines and reservations
+    parquet, which the location phase writes. That ordering already exists in the state
+    machine, which runs LocationMap to completion before UserMap.
+
+    For each id_batch resource: union its id_sources, dedupe, drop NULLs, write the list to
+    S3, and emit offset/limit shards over it. The ids themselves never enter the shard
+    payload — 20k ids is ~156KB against a 256KB Step Functions limit, and 200k would fail
+    outright. See utils.s3_writer.write_id_list_to_s3.
+    """
+    from utils.s3_writer import read_distinct_ids_from_s3, write_id_list_to_s3
+
+    base = {"account_id": account_id, "location_id": location_id, "api_base_url": api_base_url}
+    resources = [
+        r for r, c in RESOURCE_CONFIG.items()
+        if c.get("fetch_type") == "id_batch" and (tables is None or r in tables)
+    ]
+
+    shards = []
+    for resource in resources:
+        conf = RESOURCE_CONFIG[resource]
+        batch_size = conf.get("batch_size", 100)
+        ids_per_shard = _REQUESTS_PER_SHARD * batch_size
+
+        sources = [
+            (settings.S3_PREFIXES[src_resource], column)
+            for src_resource, column in conf["id_sources"]
+        ]
+        ids = await read_distinct_ids_from_s3(account_id, sources)
+
+        if not ids:
+            logger.info(f"[plan] {resource}: no referenced ids — no shards")
+            continue
+
+        await write_id_list_to_s3(account_id, location_id, resource, ids)
+
+        for offset in range(0, len(ids), ids_per_shard):
+            shards.append({
+                **base, "mode": "id_batch_shard", "resource": resource,
+                "id_offset": offset, "id_limit": ids_per_shard,
+            })
+
+        logger.info(
+            f"[plan] {resource}: {len(ids)} ids -> "
+            f"{-(-len(ids) // ids_per_shard)} shards "
+            f"({-(-len(ids) // batch_size)} requests total)"
+        )
+
+    logger.info(f"[plan] {len(shards)} transaction shards across {len(resources)} resources")
     return shards

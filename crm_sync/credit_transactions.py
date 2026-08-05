@@ -6,6 +6,7 @@ from utils.api_client import api_get
 from core.config import settings
 from crm_sync._base import extract_rel_id, extract_rel_type
 from crm_sync._base import user_sync, user_sync_unfiltered
+from crm_sync._base import id_sync
 
 logger = logging.getLogger(__name__)
 _RESOURCE = "credit_transactions"
@@ -92,6 +93,38 @@ async def fetch_page_unfiltered(location_id, page: int, account_id: str, api_bas
 
     logger.info(f"[credit_transactions] location={location_id} page={page}: {len(rows)} rows")
     return rows, resp
+
+
+async def fetch_by_ids(ids: list, account_id: str, api_base_url: str, location_id: int):
+    """
+    One request for up to ~100 ids via filter[id] — a single comma-joined parameter, not
+    repeated params. page_size is raised to cover the batch so a chunk always comes back in
+    one page: unique ids return at most one record each, so len(ids) is the ceiling.
+    """
+    params = {
+        "filter[id]": ",".join(str(i) for i in ids),
+        "page_size": max(len(ids), getattr(settings, "PAGE_SIZE", 100)),
+    }
+    resp = await api_get("/credit_transactions", api_base_url, params)
+    valid = _map_data(resp, location_id, account_id)
+    logger.info(f"[credit_transactions] filter[id] x{len(ids)}: {len(valid)} valid records")
+    return valid, resp
+
+
+async def process_id_shard(
+    ids: list, account_id: str, location_id, api_base_url: str, shard_tag: str = None,
+) -> tuple[int, int]:
+    """TransactionMap 'id_batch_shard' entry point — fetch exactly this slice of ids."""
+    return await id_sync.run(
+        resource=_RESOURCE,
+        fetch_by_ids_fn=fetch_by_ids,
+        ids=ids,
+        account_id=account_id,
+        location_id=location_id,
+        api_base_url=api_base_url,
+        s3_prefix=settings.S3_PREFIXES["credit_transactions"],
+        shard_tag=shard_tag,
+    )
 
 
 async def process_unfiltered_shard(

@@ -352,6 +352,67 @@ async def _handle_user_shard(body: dict) -> dict:
             "page_end": page_end, "records": processed, "fetched": fetched}
 
 
+async def _handle_plan_transactions(body: dict) -> dict:
+    """
+    mode=plan_transactions — phase 2 of planning, run AFTER Stage1_LocationMap.
+
+    Collects the transaction ids this location actually references from the order_lines and
+    reservations parquet the location phase just wrote, persists each resource's id list to
+    S3, and returns offset/limit shards over it. Only the shards travel through the state
+    machine; the ids stay in S3.
+    """
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+
+    from crm_sync.state import plan_transaction_shards
+    transaction_shards = await plan_transaction_shards(
+        account_id, location_id, api_base_url, tables=body.get("tables")
+    )
+    logger.info(f"[plan_transactions] account={account_id}: {len(transaction_shards)} shards")
+    return {
+        "status": "success",
+        "account_id": account_id,
+        "location_id": location_id,
+        "api_base_url": api_base_url,
+        "transaction_shards": transaction_shards,
+        "shard_count": len(transaction_shards),
+    }
+
+
+async def _handle_id_batch_shard(body: dict) -> dict:
+    """
+    mode=id_batch_shard — one slice of a resource's id list, fetched via filter[id].
+
+    Replaces the whole-tenant download these resources used to do. The slice is read from
+    S3 rather than passed inline, so the payload stays small and a failed shard can be
+    re-run on its own.
+    """
+    from utils.s3_writer import read_id_list_from_s3
+    resource = body["resource"]
+    account_id = body["account_id"]
+    location_id = body["location_id"]
+    api_base_url = body["api_base_url"]
+    id_offset = int(body.get("id_offset", 0))
+    id_limit = body.get("id_limit")
+
+    ids = await read_id_list_from_s3(account_id, location_id, resource, id_offset, id_limit)
+    if not ids:
+        logger.info(f"[id_batch_shard] {resource} offset={id_offset}: empty slice — skipping")
+        return {"status": "success", "resource": resource, "records": 0, "fetched": 0,
+                "id_offset": id_offset, "ids": 0}
+
+    # Shard-unique S3 tag so slices of the same resource cannot collide on S3 keys,
+    # mirroring the "_ub_" tag the user-batch path uses.
+    shard_tag = f"{location_id}_ib_{id_offset}"
+    mod = importlib.import_module(f"crm_sync.{resource}")
+    processed, fetched = await mod.process_id_shard(
+        ids, account_id, location_id, api_base_url, shard_tag=shard_tag
+    )
+    return {"status": "success", "resource": resource, "records": processed,
+            "fetched": fetched, "id_offset": id_offset, "ids": len(ids)}
+
+
 async def _handle_user_batch_shard(body: dict) -> dict:
     """
     mode=user_batch_shard — a slice of customers (user_offset..user_offset+user_limit),
@@ -387,6 +448,8 @@ _MODE_HANDLERS = {
     "backfill_plan": _handle_backfill_plan,
     "location_shard": _handle_location_shard,
     "user_shard": _handle_user_shard,
+    "plan_transactions": _handle_plan_transactions,
+    "id_batch_shard": _handle_id_batch_shard,
     "user_batch_shard": _handle_user_batch_shard,
     "tenant_shard": _handle_tenant_shard,
 }

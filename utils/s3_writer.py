@@ -3,6 +3,7 @@ import boto3
 
 # utils/s3_writer.py
 import io
+import json
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -107,6 +108,91 @@ async def read_customer_ids_from_s3(account_id: str, customers_prefix: str = Non
 
     logger.info(f"[S3] Read {len(customer_ids)} customer_ids from s3://{settings.S3_BUCKET}/{prefix}")
     return customer_ids
+
+
+async def read_distinct_ids_from_s3(account_id: str, sources: list) -> list:
+    """
+    Distinct, non-NULL ids across one or more (s3_prefix, column) parquet sources.
+
+    Used by the id_batch planner: `credit_transactions` is the union of
+    order_lines.credit_transactions_id and reservations.credit_transactions_id, so the
+    fetch asks for exactly the transactions this location references.
+
+    Reads only the one column per file, like read_customer_ids_from_s3 — the parquet row
+    groups here are wide and there is no reason to pull them.
+    """
+    session = get_session()
+    ids: set = set()
+
+    async with session.create_client("s3", region_name=region) as s3_client:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for s3_prefix, column in sources:
+            prefix = f"{s3_prefix}/account_id_{account_id}/"
+            keys = []
+            async for page in paginator.paginate(Bucket=settings.S3_BUCKET, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    if obj["Key"].endswith(".parquet"):
+                        keys.append(obj["Key"])
+
+            before = len(ids)
+            for key in keys:
+                resp = await s3_client.get_object(Bucket=settings.S3_BUCKET, Key=key)
+                body = await resp["Body"].read()
+                table = pq.read_table(io.BytesIO(body), columns=[column])
+                ids.update(
+                    str(v) for v in table.column(column).to_pylist()
+                    if v is not None and str(v) != ""
+                )
+            logger.info(
+                f"[S3] {s3_prefix}.{column}: {len(keys)} files, "
+                f"+{len(ids) - before} new ids (running total {len(ids)})"
+            )
+
+    # Sorted so shard slices are stable across re-planning — a re-run of one shard fetches
+    # the same ids it did the first time.
+    return sorted(ids, key=lambda x: (len(x), x))
+
+
+def _id_list_key(account_id: str, location_id, resource: str) -> str:
+    # Scoped by location as well as account: one execution processes several
+    # (account, location) pairs in sequence, and a half-finished run is much easier to read
+    # when each location's list is its own object.
+    return f"_idlists/account_id_{account_id}/location_{location_id}/{resource}.json"
+
+
+async def write_id_list_to_s3(account_id: str, location_id, resource: str, ids: list) -> str:
+    """
+    Persist a resource's id list so shards read a slice instead of receiving it inline.
+
+    20k ids is ~156KB and 200k is ~1.5MB, against a 256KB Step Functions payload limit — so
+    the list cannot travel through the state machine. It also makes a failed shard
+    re-runnable on its own, since the list is still here rather than needing recomputation
+    from the parquets.
+    """
+    key = _id_list_key(account_id, location_id, resource)
+    body = json.dumps(ids).encode()
+    session = get_session()
+    async with session.create_client("s3", region_name=region) as s3_client:
+        await s3_client.put_object(Bucket=settings.S3_BUCKET, Key=key, Body=body)
+    logger.info(f"[S3] wrote {len(ids)} {resource} ids to s3://{settings.S3_BUCKET}/{key}")
+    return key
+
+
+async def read_id_list_from_s3(
+    account_id: str, location_id, resource: str, offset: int = 0, limit: int = None
+) -> list:
+    """One shard's slice of the id list written by write_id_list_to_s3."""
+    key = _id_list_key(account_id, location_id, resource)
+    session = get_session()
+    async with session.create_client("s3", region_name=region) as s3_client:
+        resp = await s3_client.get_object(Bucket=settings.S3_BUCKET, Key=key)
+        ids = json.loads(await resp["Body"].read())
+    sliced = ids[offset:] if limit is None else ids[offset:offset + int(limit)]
+    logger.info(
+        f"[S3] read {len(sliced)} {resource} ids "
+        f"(offset={offset}, limit={limit}, total={len(ids)})"
+    )
+    return sliced
 
 
 def refresh_source(name):
