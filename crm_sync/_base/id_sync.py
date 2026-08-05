@@ -73,7 +73,9 @@ async def run(
 
     for n, chunk in enumerate(_chunks(ids, batch_size), start=1):
         chunk_rows, resp = await fetch_by_ids_fn(chunk, account_id, api_base_url, location_id)
-        returned = len(resp.get("data", []))
+        # `or []` not a .get default — a filter[id] response can carry an explicit null for
+        # keys a paginated response fills in, and the default only applies to a MISSING key.
+        returned = len(resp.get("data") or [])
         total_fetched += returned
 
         # The filter is the whole optimisation, so prove it was applied. A silently ignored

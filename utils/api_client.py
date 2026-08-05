@@ -151,6 +151,11 @@ async def api_get(path: str, api_base_url: str, params=None):
         resp.raise_for_status()
         data = await resp.json()
         n = len(data.get("data", [])) if isinstance(data, dict) and isinstance(data.get("data"), list) else "?"
-        total = (data.get("meta", {}).get("pagination", {}).get("count") if isinstance(data, dict) else None)
+        # `or {}` rather than a .get default: the default only applies when the key is
+        # ABSENT, and MarianaTek sends an explicit "meta": null on responses that do not
+        # paginate — filter[id] queries among them. .get("meta", {}) returns None there and
+        # the next .get() raises. This is only a log line; it must never fail the request.
+        meta = (data.get("meta") or {}) if isinstance(data, dict) else {}
+        total = (meta.get("pagination") or {}).get("count")
         logger.info(f"[api_get] → {resp.status}, {n} records on page (meta.count={total})")
         return data
