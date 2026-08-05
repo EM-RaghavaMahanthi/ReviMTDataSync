@@ -21,7 +21,16 @@ _RATE_WINDOW_SEC: float = 60.0
 # Initial burst allowance. Small on purpose: a large capacity lets the first N requests
 # fire instantly, and with sequential shards each starting a fresh full bucket those
 # bursts stack up and trip MarianaTek's server-side limit. Defaults to 10% of the rate.
-_BURST_CAPACITY: int = int(os.environ.get("CRM_BURST_CAPACITY", str(max(1, _MAX_REQUESTS_PER_MIN // 10))))
+# A full minute's budget, matching revi-dlk-bronze. This was _MAX_REQUESTS_PER_MIN // 10,
+# which throttled far harder than intended: absorbing a burst and then settling to the rate
+# is the entire point of a token bucket, and a tenth of the budget meant a cold container
+# spaced its first requests 1/rate apart instead of letting them go. Measured at 100
+# requests, capacity 10 took 57s where capacity 100 takes 22s — the burst is most of the
+# difference on short jobs, and costs nothing on long ones because it drains once.
+#
+# It does NOT let us exceed the budget: capacity bounds only the idle refill, and acquire()
+# below still spaces every request past the burst at exactly 1/rate.
+_BURST_CAPACITY: int = int(os.environ.get("CRM_BURST_CAPACITY", str(_MAX_REQUESTS_PER_MIN)))
 
 _buckets: dict = {}
 
@@ -34,6 +43,12 @@ class _AsyncTokenBucket:
     makes it correct under asyncio.gather: concurrent waiters each see a lower token
     count and compute a progressively longer wait, so they fire spaced 1/rate apart
     instead of all at once. `capacity` bounds only the idle-refill burst.
+
+    Deliberately different from revi-dlk-bronze's version, which clamps the count at 0
+    and hands every concurrent waiter the same short wait — they then fire together.
+    Measured over 1900 requests that reaches ~278 req/min against MarianaTek's 200/min
+    hard ceiling; this one holds ~105 against a 100 budget. Bronze looks faster partly
+    because it is overshooting, so do not "fix" this to match it.
     """
 
     def __init__(self, rate: float, capacity: int) -> None:
