@@ -43,7 +43,9 @@ def _map_record(u, location_id, account_id, crm_downloaded_at):
 def _map_data(resp, location_id, account_id):
     crm_downloaded_at = datetime.now(timezone.utc)
     valid = []
-    for u in resp.get("data", []):
+    # `or []` not a .get default: this API sends explicit nulls (meta and links come
+    # back null on filter[id] responses), and the default only covers a MISSING key.
+    for u in (resp.get("data") or []):
         try:
             valid.append(_map_record(u, location_id, account_id, crm_downloaded_at))
         except ValidationError as ve:
@@ -77,7 +79,9 @@ async def fetch_page_unfiltered(location_id, page: int, account_id: str, api_bas
 
     crm_downloaded_at = datetime.now(timezone.utc)
     rows = []
-    for u in resp.get("data", []):
+    # `or []` not a .get default: this API sends explicit nulls (meta and links come
+    # back null on filter[id] responses), and the default only covers a MISSING key.
+    for u in (resp.get("data") or []):
         rels = u.get("relationships", {})
         try:
             row = _map_record(u, location_id, account_id, crm_downloaded_at)
