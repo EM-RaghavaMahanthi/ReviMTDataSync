@@ -14,10 +14,19 @@ enough (see crm_sync/config.py). This sends ONE comma-joined `filter[id]` parame
 instead — about 800 characters for 100 seven-digit ids — which is the shape MarianaTek
 actually supports.
 
+Concurrency mirrors the other runners — a Semaphore bounding in-flight requests, with the
+token bucket in utils/api_client as the actual rate limiter — but it is applied to CHUNKS
+rather than to pages. revi-dlk-bronze's user_sync_batch parallelises pages within a chunk
+because 100 users span many pages; a filter[id] call for N ids returns at most N records,
+so every chunk here is exactly one page and the only axis to parallelise is the chunks
+themselves. Running them sequentially caps throughput at 1/latency — roughly 20 requests a
+minute against a 100/min budget.
+
 fetch_by_ids_fn signature (provided by the resource module):
   async (ids, account_id, api_base_url, location_id) -> (rows: list[dict], resp: dict)
 """
 
+import asyncio
 import logging
 import time
 
@@ -41,6 +50,7 @@ async def run(
     s3_prefix: str,
     shard_tag: str = None,
     batch_size: int = None,
+    concurrency_limit: int = None,
     parquet_batch_size: int = None,
 ) -> tuple[int, int]:
     """
@@ -51,6 +61,8 @@ async def run(
     start_time = time.time()
     # settings.MAX_IDS, not a module constant — one env var controls it everywhere.
     batch_size = batch_size or int(getattr(settings, "MAX_IDS", 200))
+    if concurrency_limit is None:
+        concurrency_limit = settings.CONCURRENCY_LIMIT
     if parquet_batch_size is None:
         parquet_batch_size = int(settings.PARQUET_BATCH_SIZE)
 
@@ -61,23 +73,32 @@ async def run(
 
     logger.info(
         f"[{tag}] fetching {len(ids)} ids in {-(-len(ids) // batch_size)} requests "
-        f"of {batch_size}"
+        f"of {batch_size}, up to {concurrency_limit} in flight"
     )
 
-    rows = []
-    total_fetched = 0
+    # Concurrent, bounded by the same semaphore the page-based runners use. The token
+    # bucket in api_client is a CEILING, not a scheduler — it can slow requests down but
+    # never runs them in parallel, so a sequential loop tops out at 1/latency regardless of
+    # CRM_MAX_REQUESTS_PER_MIN. At ~3s per call that is ~20 requests/min against a budget of
+    # 100. The semaphore caps in-flight work; the bucket still enforces the rate.
+    chunks = list(_chunks(ids, batch_size))
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    done = 0
 
-    for n, chunk in enumerate(_chunks(ids, batch_size), start=1):
-        chunk_rows, resp = await fetch_by_ids_fn(chunk, account_id, api_base_url, location_id)
+    async def fetch_one(chunk):
+        nonlocal done
+        async with semaphore:
+            chunk_rows, resp = await fetch_by_ids_fn(
+                chunk, account_id, api_base_url, location_id
+            )
         # `or []` not a .get default — a filter[id] response can carry an explicit null for
         # keys a paginated response fills in, and the default only applies to a MISSING key.
         returned = len(resp.get("data") or [])
-        total_fetched += returned
 
         # The filter is the whole optimisation, so prove it was applied. A silently ignored
         # filter[id] returns a full page instead of at most one record per requested id —
         # the request would succeed, the data would look plausible, and we would quietly be
-        # back to downloading the entire tenant. Fail on the first chunk instead.
+        # back to downloading the entire tenant. Fail the shard instead.
         if returned > len(chunk):
             raise RuntimeError(
                 f"{resource}: filter[id] appears to be ignored by this endpoint — asked for "
@@ -85,9 +106,18 @@ async def run(
                 f"this would silently fetch the whole tenant."
             )
 
+        done += 1
+        if done % 20 == 0:
+            logger.info(f"[{tag}] {done}/{len(chunks)} requests done")
+        return chunk_rows, returned
+
+    results = await asyncio.gather(*[fetch_one(c) for c in chunks])
+
+    rows = []
+    total_fetched = 0
+    for chunk_rows, returned in results:
         rows.extend(chunk_rows)
-        if n % 20 == 0:
-            logger.info(f"[{tag}] {n} requests done, {len(rows)} rows so far")
+        total_fetched += returned
 
     # Ids we asked for and did not get back. Expected in small numbers — a transaction
     # deleted in the CRM but still referenced by an order_line — and worth seeing, because a
