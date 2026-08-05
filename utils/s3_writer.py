@@ -110,6 +110,37 @@ async def read_customer_ids_from_s3(account_id: str, customers_prefix: str = Non
     return customer_ids
 
 
+def _normalise_id(v) -> str | None:
+    """
+    An id column that permits NULL comes back as a FLOAT, not an int.
+
+    The schema declares these Optional[int], third-party rows carry None, and pandas has no
+    nullable-int dtype by default — so DataFrame(...) widens the column to float64,
+    pa.Table.from_pandas writes doubles, and to_pylist() hands back 1847.0. str() of that is
+    "1847.0", and filter[id]=1847.0 matches nothing: the request succeeds, returns zero
+    records, and looks like the ids simply do not exist.
+
+    So collapse anything integral to its plain integer form.
+    """
+    if v is None:
+        return None
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):   # NaN / inf
+            return None
+        if not v.is_integer():
+            return None
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    # A float that already went through str() somewhere upstream.
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
 async def read_distinct_ids_from_s3(account_id: str, sources: list) -> list:
     """
     Distinct, non-NULL ids across one or more (s3_prefix, column) parquet sources.
@@ -140,8 +171,8 @@ async def read_distinct_ids_from_s3(account_id: str, sources: list) -> list:
                 body = await resp["Body"].read()
                 table = pq.read_table(io.BytesIO(body), columns=[column])
                 ids.update(
-                    str(v) for v in table.column(column).to_pylist()
-                    if v is not None and str(v) != ""
+                    n for n in (_normalise_id(v) for v in table.column(column).to_pylist())
+                    if n is not None
                 )
             logger.info(
                 f"[S3] {s3_prefix}.{column}: {len(keys)} files, "
@@ -149,8 +180,12 @@ async def read_distinct_ids_from_s3(account_id: str, sources: list) -> list:
             )
 
     # Sorted so shard slices are stable across re-planning — a re-run of one shard fetches
-    # the same ids it did the first time.
-    return sorted(ids, key=lambda x: (len(x), x))
+    # the same ids it did the first time. Numeric where possible so the ordering matches
+    # what a human reading the id list expects.
+    out = sorted(ids, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+    if out:
+        logger.info(f"[S3] {len(out)} distinct ids, sample: {out[:5]}")
+    return out
 
 
 # Prefix for the id lists the id_batch planner writes. Not one of settings.S3_PREFIXES —
