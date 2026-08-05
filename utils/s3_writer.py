@@ -153,11 +153,17 @@ async def read_distinct_ids_from_s3(account_id: str, sources: list) -> list:
     return sorted(ids, key=lambda x: (len(x), x))
 
 
+# Prefix for the id lists the id_batch planner writes. Not one of settings.S3_PREFIXES —
+# those are parquet datasets consumed downstream; this is planner scratch. Named here so the
+# writer and the stale-clear in handlers/crm_to_s3.py cannot drift apart.
+ID_LIST_PREFIX = "_idlists"
+
+
 def _id_list_key(account_id: str, location_id, resource: str) -> str:
     # Scoped by location as well as account: one execution processes several
     # (account, location) pairs in sequence, and a half-finished run is much easier to read
     # when each location's list is its own object.
-    return f"_idlists/account_id_{account_id}/location_{location_id}/{resource}.json"
+    return f"{ID_LIST_PREFIX}/account_id_{account_id}/location_{location_id}/{resource}.json"
 
 
 async def write_id_list_to_s3(account_id: str, location_id, resource: str, ids: list) -> str:

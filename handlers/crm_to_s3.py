@@ -224,10 +224,16 @@ async def _handle_plan(body: dict) -> dict:
 
     # One-time stale-clear for every resource prefix — shards only append afterwards,
     # so clearing here (not per-shard) prevents shards from wiping each other's output.
-    from utils.s3_writer import delete_account_prefix
+    from utils.s3_writer import delete_account_prefix, ID_LIST_PREFIX
     for resource, prefix in settings.S3_PREFIXES.items():
         if prefix:
             await delete_account_prefix(account_id, prefix)
+
+    # The id_batch planner's lists too. Overwriting already keeps them correct — each run
+    # rewrites its list before sharding — but lists for locations no longer onboarded would
+    # otherwise linger forever, and a stale file sitting beside a fresh one is exactly what
+    # misleads someone reading S3 during an incident.
+    await delete_account_prefix(account_id, ID_LIST_PREFIX)
 
     from crm_sync.state import plan_location_shards, plan_user_shards
     location_shards, user_shards = await asyncio.gather(
