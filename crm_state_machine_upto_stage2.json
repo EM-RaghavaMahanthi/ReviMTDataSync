@@ -149,16 +149,13 @@
           },
           "Stage1_PlanTransactions": {
             "Type": "Task",
-            "Comment": "Phase 2 of planning. Collects the credit/membership transaction ids this location actually references from the order_lines and reservations parquet LocationMap just wrote, persists each id list to S3, and returns only offset/limit shards \u2014 the ids never cross a state transition.",
+            "Comment": "Phase 2 of planning. Collects the credit/membership transaction ids this location actually references from the order_lines and reservations parquet LocationMap just wrote, persists each id list to S3, and returns only offset/limit shards \u2014 the ids never cross a state transition. No ResultSelector: this Resource is a direct function ARN, so the result is the handler's return value with no Payload envelope \u2014 same as Stage1_Plan, which the Map's ItemsPath already assumes.",
             "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
             "Parameters": {
               "mode": "plan_transactions",
               "account_id.$": "$.account_id",
               "location_id.$": "$.location_id",
               "api_base_url.$": "$.api_base_url"
-            },
-            "ResultSelector": {
-              "transaction_shards.$": "$.Payload.transaction_shards"
             },
             "ResultPath": "$.transactions_plan",
             "Retry": [
