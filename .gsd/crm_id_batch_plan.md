@@ -111,6 +111,40 @@ Both mirror `_handle_user_batch_shard`, which already does read-slice → batch 
 machinery is the closest thing to what is needed and should be reworked rather than written
 fresh.
 
+### 3b. What crosses the state machine, and what goes to S3
+
+Step Functions caps a state payload at **256 KB**, and an execution that trips it fails
+mid-run with nothing useful in the output. Measured, so the split is a decision rather than
+a guess:
+
+| | size | where |
+|---|---|---|
+| one shard entry | 180 bytes | — |
+| 50 shards | 8 KB | **inline** |
+| 500 shards | 87 KB | **inline**, still comfortable |
+| 20 000 ids | **156 KB** | **S3** |
+| 200 000 ids | **1.5 MB** | **S3** — would fail outright |
+
+So: **id lists always go to S3; shard lists stay inline.** Shards are metadata — a resource
+name and an offset — and stay small however big the tenant is. Id lists scale with the
+data and are the only thing that can burst the limit.
+
+Concretely, `Stage1_PlanTransactions` writes one object per resource:
+
+```
+s3://<bucket>/<account_id>/_idlists/credit_transactions.json
+s3://<bucket>/<account_id>/_idlists/membership_transactions.json
+```
+
+and returns only `[{resource, id_offset, id_limit}, …]`. Each shard reads its own slice, so
+no id ever travels through a state transition, and the plan output stays a few KB no matter
+how large the location is. It also makes a failed shard re-runnable on its own — the id list
+is still sitting in S3 rather than having to be recomputed from the parquets.
+
+If the shard list itself ever did grow past the limit, the fix is a Distributed Map with
+`ItemReader` pointed at an S3 object rather than `ItemsPath`. At 180 bytes a shard that is
+thousands of shards away, so it is not worth the change in execution semantics now.
+
 ### 4. `utils/s3_writer.py` — id list helpers
 
 `read_customer_ids_from_s3` is the existing pattern. Add the generic pair:
