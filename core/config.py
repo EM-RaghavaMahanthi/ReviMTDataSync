@@ -14,7 +14,13 @@ class Settings(BaseSettings):
     PARQUET_BATCH_SIZE: int = 1000
     S3_BUCKET: str = ""  # optional - only Lambdas that actually write to S3 need this set
     CONCURRENCY_LIMIT: int = 16
-    PAGE_SIZE: int = 500  # MarianaTek confirmed page_size up to 500 on all endpoints
+    PAGE_SIZE: int = 200  # MarianaTek confirmed page_size up to 500 on all endpoints
+
+    # Ids per filter[id] call for the id_batch resources. Bounded by query-string length,
+    # not by page size: 200 seven-digit ids is ~1.6KB of query string. Kept as its own knob
+    # rather than reusing PAGE_SIZE — one is "how many records per page", the other is "how
+    # many ids fit in a URL", and they are limited by different things.
+    MAX_IDS: int = 200
 
     # Per-tenant request rate cap (50% of MarianaTek's 200 req/min ceiling — headroom
     # for the in-process token bucket in utils/api_client.py). Read there via os.environ.

@@ -29,7 +29,8 @@ expect the mapped schema). So this config carries only orchestration metadata:
                  None = no scoping param (paginate the whole endpoint)
   id_sources   — [(resource, column), …] whose parquet supplies the ids (id_batch only).
                  The union across sources is deduped and NULLs dropped.
-  batch_size   — ids per API call (id_batch / user_batch resources only)
+  batch_size   — ids per API call. Optional override; defaults to settings.MAX_IDS so the
+                 request size is one env var rather than a per-resource literal
 """
 
 LOCATION_RESOURCES = ["customers", "orders", "order_lines", "class_sessions", "reservations"]
@@ -75,14 +76,12 @@ RESOURCE_CONFIG: dict = {
         "fetch_type": "id_batch",
         "id_sources": [("order_lines", "credit_transactions_id"),
                        ("reservations", "credit_transactions_id")],
-        "batch_size": 100,
     },
     "membership_transactions": {
         "endpoint": "/membership_transactions",
         "fetch_type": "id_batch",
         "id_sources": [("order_lines", "membership_transactions_id"),
                        ("reservations", "membership_transactions_id")],
-        "batch_size": 100,
     },
 
     # Notes: whole-tenant download (NO location filter), filtered by customer_id client-side.

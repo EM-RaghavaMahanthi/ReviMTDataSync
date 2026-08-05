@@ -181,7 +181,7 @@ async def plan_transaction_shards(
     shards = []
     for resource in resources:
         conf = RESOURCE_CONFIG[resource]
-        batch_size = conf.get("batch_size", 100)
+        batch_size = conf.get("batch_size") or int(getattr(settings, "MAX_IDS", 200))
         ids_per_shard = _REQUESTS_PER_SHARD * batch_size
 
         sources = [

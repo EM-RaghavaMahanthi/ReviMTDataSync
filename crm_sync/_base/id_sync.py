@@ -26,11 +26,6 @@ from utils.s3_writer import write_parquet_to_s3
 
 logger = logging.getLogger(__name__)
 
-# Ids per request. Bounded by query-string length, not by page size: 100 seven-digit ids
-# is ~800 characters, well short of anything that would truncate.
-DEFAULT_BATCH_SIZE = 100
-
-
 def _chunks(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
@@ -54,7 +49,8 @@ async def run(
     """
     tag = resource.upper()
     start_time = time.time()
-    batch_size = batch_size or DEFAULT_BATCH_SIZE
+    # settings.MAX_IDS, not a module constant — one env var controls it everywhere.
+    batch_size = batch_size or int(getattr(settings, "MAX_IDS", 200))
     if parquet_batch_size is None:
         parquet_batch_size = int(settings.PARQUET_BATCH_SIZE)
 
