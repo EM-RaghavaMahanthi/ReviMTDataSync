@@ -1,0 +1,360 @@
+{
+  "Comment": "Data sync orchestration: Stage0 fetch accounts, then per-account Stage1 CRM->S3 (Plan -> LocationMap -> UserMap, sequential page-range shards, MaxConcurrency=1 so the per-tenant token bucket governs the request rate), Stage2 S3->staging DB, Stage3 staging->main DB. Each stage ends in a Fail on error. Variant that stops after Stage 2 (S3 -> staging DB). Stage 3 (staging -> main DB) is deliberately absent, so a run lands data in the staging tables and leaves production untouched \u2014 for verifying a CRM-side change end to end without writing to the main tables. Generated from crm_state_machine.json; keep the two in step.",
+  "StartAt": "GetAccountsDetails",
+  "States": {
+    "GetAccountsDetails": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-data-fixes-temp",
+      "Parameters": {
+        "event_type": "get_all_accounts_details",
+        "account_ids.$": "$.accounts"
+      },
+      "ResultPath": "$.stage0_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "CheckStage0Status",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Stage0Failed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "CheckStage0Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.stage0_result.status",
+          "StringEquals": "success",
+          "Next": "ProcessAllAccounts"
+        }
+      ],
+      "Default": "Stage0Failed"
+    },
+    "Stage0Failed": {
+      "Type": "Fail",
+      "Error": "Stage0Failed",
+      "Cause": "Stage 0 failed - could not retrieve account details"
+    },
+    "ProcessAllAccounts": {
+      "Type": "Map",
+      "MaxConcurrency": 1,
+      "ItemsPath": "$.stage0_result.data.accounts_details",
+      "ItemSelector": {
+        "account_id.$": "$$.Map.Item.Value.account_id",
+        "location_id.$": "$$.Map.Item.Value.location_id",
+        "api_base_url.$": "$$.Map.Item.Value.api_base_url"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Stage1_Plan",
+        "States": {
+          "Stage1_Plan": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+            "Parameters": {
+              "mode": "plan",
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "api_base_url.$": "$.api_base_url"
+            },
+            "ResultPath": "$.plan",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "Stage1_LocationMap",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage1Failed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Stage1_LocationMap": {
+            "Type": "Map",
+            "MaxConcurrency": 1,
+            "ItemsPath": "$.plan.location_shards",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "LocationShard",
+              "States": {
+                "LocationShard": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 5,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "MaxDelaySeconds": 60,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": null,
+            "Next": "Stage1_PlanTransactions",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage1Failed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Stage1_PlanTransactions": {
+            "Type": "Task",
+            "Comment": "Phase 2 of planning. Collects the credit/membership transaction ids this location actually references from the order_lines and reservations parquet LocationMap just wrote, persists each id list to S3, and returns only offset/limit shards \u2014 the ids never cross a state transition.",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+            "Parameters": {
+              "mode": "plan_transactions",
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "api_base_url.$": "$.api_base_url"
+            },
+            "ResultSelector": {
+              "transaction_shards.$": "$.Payload.transaction_shards"
+            },
+            "ResultPath": "$.transactions_plan",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage1Failed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "Stage1_TransactionMap"
+          },
+          "Stage1_TransactionMap": {
+            "Type": "Map",
+            "Comment": "Fetches exactly the referenced transactions via filter[id], ~100 ids per request. Replaces a whole-tenant download that pulled ~50x what it kept for a 50-location tenant. MaxConcurrency matches its neighbours so total CRM concurrency is unchanged.",
+            "MaxConcurrency": 1,
+            "ItemsPath": "$.transactions_plan.transaction_shards",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "TransactionShard",
+              "States": {
+                "TransactionShard": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 5,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "MaxDelaySeconds": 60,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": null,
+            "Next": "Stage1_UserMap",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage1Failed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Stage1_UserMap": {
+            "Type": "Map",
+            "MaxConcurrency": 1,
+            "ItemsPath": "$.plan.user_shards",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "UserShard",
+              "States": {
+                "UserShard": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 5,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "MaxDelaySeconds": 60,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": null,
+            "Next": "Stage2_S3ToStagingDb",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage1Failed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Stage1Failed": {
+            "Type": "Fail",
+            "Error": "Stage1Failed",
+            "Cause": "Stage 1 failed - one or more CRM->S3 shards did not succeed"
+          },
+          "Stage2_S3ToStagingDb": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-crm-db-sync",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id"
+            },
+            "ResultPath": "$.stage2_result",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "CheckStage2Status",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage2Failed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "CheckStage2Status": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.stage2_result.status",
+                "StringEquals": "success",
+                "Next": "AccountProcessSuccess"
+              }
+            ],
+            "Default": "Stage2Failed"
+          },
+          "Stage2Failed": {
+            "Type": "Fail",
+            "Error": "Stage2Failed",
+            "Cause": "Stage 2 failed - S3 to staging-DB sync status was not success"
+          },
+          "AccountProcessSuccess": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "SUCCESS",
+              "message": "Stages 0-2 completed successfully for this account \u2014 data is in the staging tables; Stage 3 (staging -> main DB) was not run",
+              "stopped_after": "stage2"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "FinalSummary"
+    },
+    "FinalSummary": {
+      "Type": "Pass",
+      "Parameters": {
+        "workflow_status": "COMPLETED",
+        "execution_name.$": "$$.Execution.Name",
+        "accounts_succeeded.$": "States.ArrayLength($)",
+        "results.$": "$"
+      },
+      "End": true
+    }
+  }
+}
