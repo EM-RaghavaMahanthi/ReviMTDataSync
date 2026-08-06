@@ -123,15 +123,31 @@ VARCHAR_LIMITS = {
     "note_id": 64, "author_id": 255, "tag_id": 64, "tenant_name": 100,
 }
 
+# Notes and tags only.
+#
+# RDS onboarding no longer runs for the CRM tables — orders, reservations, order_lines,
+# class_sessions, customers, membership_instances and the two transaction tables reach RDS
+# by other paths now. The only datasets this stage still stages are the three behind
+# customer_notes, customer_tags_default and customer_tag_assignments, which is exactly what
+# Stage 3 reads: mt_user_notes_details_dlk, mt_user_tags_details_dlk,
+# mt_customer_tags_details_dlk.
+#
+# The eight entries below are COMMENTED, not deleted — the s3_prefix settings and the
+# staging DDL further down this module are still correct, so restoring one is uncommenting
+# a line rather than reconstructing it.
+#
+# Consequence, deliberate: the main onboarding state machine calls this same lambda for its
+# Stage2_S3ToStagingDb, so its Stage 3 (revi-data-sync-stg-to-db) now finds no staging for
+# those eight and inserts nothing for them.
 TABLE_S3_CONFIG = {
-    "customers":               {"s3_prefix": settings.CUSTOMERS_S3_PREFIX,               "staging_table": "mt_customers_details_dlk"},
-    "orders":                  {"s3_prefix": settings.ORDERS_S3_PREFIX,                  "staging_table": "mt_orders_details_dlk"},
-    "order_lines":             {"s3_prefix": settings.ORDER_LINES_S3_PREFIX,             "staging_table": "mt_order_lines_details_dlk"},
-    "class_sessions":          {"s3_prefix": settings.CLASS_SESSIONS_S3_PREFIX,          "staging_table": "mt_class_sessions_details_dlk"},
-    "reservations":            {"s3_prefix": settings.RESERVATIONS_S3_PREFIX,            "staging_table": "mt_reservations_details_dlk"},
-    "membership_instances":    {"s3_prefix": settings.MEMBERSHIP_INSTANCES_S3_PREFIX,    "staging_table": "mt_membership_instances_details_dlk"},
-    "credit_transactions":     {"s3_prefix": settings.CREDIT_TRANSACTIONS_S3_PREFIX,     "staging_table": "mt_credit_transactions_details_dlk"},
-    "membership_transactions": {"s3_prefix": settings.MEMBERSHIP_TRANSACTIONS_S3_PREFIX, "staging_table": "mt_membership_transactions_details_dlk"},
+    # "customers":               {"s3_prefix": settings.CUSTOMERS_S3_PREFIX,               "staging_table": "mt_customers_details_dlk"},
+    # "orders":                  {"s3_prefix": settings.ORDERS_S3_PREFIX,                  "staging_table": "mt_orders_details_dlk"},
+    # "order_lines":             {"s3_prefix": settings.ORDER_LINES_S3_PREFIX,             "staging_table": "mt_order_lines_details_dlk"},
+    # "class_sessions":          {"s3_prefix": settings.CLASS_SESSIONS_S3_PREFIX,          "staging_table": "mt_class_sessions_details_dlk"},
+    # "reservations":            {"s3_prefix": settings.RESERVATIONS_S3_PREFIX,            "staging_table": "mt_reservations_details_dlk"},
+    # "membership_instances":    {"s3_prefix": settings.MEMBERSHIP_INSTANCES_S3_PREFIX,    "staging_table": "mt_membership_instances_details_dlk"},
+    # "credit_transactions":     {"s3_prefix": settings.CREDIT_TRANSACTIONS_S3_PREFIX,     "staging_table": "mt_credit_transactions_details_dlk"},
+    # "membership_transactions": {"s3_prefix": settings.MEMBERSHIP_TRANSACTIONS_S3_PREFIX, "staging_table": "mt_membership_transactions_details_dlk"},
     "user_notes":              {"s3_prefix": settings.USER_NOTES_S3_PREFIX,               "staging_table": "mt_user_notes_details_dlk"},
     "user_tags":               {"s3_prefix": settings.USER_TAGS_S3_PREFIX,                "staging_table": "mt_user_tags_details_dlk"},
     "customer_tags":           {"s3_prefix": settings.CUSTOMER_TAGS_S3_PREFIX,            "staging_table": "mt_customer_tags_details_dlk"},
@@ -552,9 +568,21 @@ def etl_all_tables(bucket: str, account_id: str, engine, check_stale: bool = Fal
     stale_update_success = True
     stale_results = None
     if check_stale:
-        logger.info("Running stale data update...")
-        stale_results = update_stale_data(engine, account_id, update=True)
-        stale_update_success = stale_results.get("success", False)
+        # Disabled with TABLE_S3_CONFIG above. update_stale_data reads seven staging tables
+        # — mt_{class_sessions,orders,order_lines,reservations,credit_transactions,
+        # membership_transactions,membership_instances}_details_dlk — every one of which is
+        # in the commented-out block and is therefore no longer created. Running it would
+        # fail on the first query with "relation does not exist".
+        #
+        # Refusing rather than quietly skipping: CHECK_STALE_DATA being true means someone
+        # expects main tables to be updated, and silently doing nothing would be worse than
+        # saying it cannot. Uncomment the CRM tables above to restore both together.
+        logger.warning(
+            "CHECK_STALE_DATA is set, but the stale update covers only the CRM tables that "
+            "TABLE_S3_CONFIG no longer stages — skipping it. Unset CHECK_STALE_DATA, or "
+            "restore the commented entries in TABLE_S3_CONFIG if RDS onboarding is coming "
+            "back."
+        )
 
     return {
         "etl_success": len(failed_tables) == 0,
