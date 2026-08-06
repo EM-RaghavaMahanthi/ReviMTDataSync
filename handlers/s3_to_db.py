@@ -30,7 +30,10 @@ def _notify_stage2(account_id, etl_success: bool, failed_tables: list, elapsed: 
 def lambda_handler(event, context=None):
     account_id = event.get("account_id")
     location_id = event.get("location_id")
-    check_stale = settings.CHECK_STALE_DATA
+    # Stale update removed from this stage — it only ever covered the CRM tables that
+    # TABLE_S3_CONFIG no longer stages. CHECK_STALE_DATA is left unread rather than the
+    # setting deleted, so an env var still set on a deployed function is simply inert.
+    # check_stale = settings.CHECK_STALE_DATA
 
     if not account_id:
         logger.error("account_id is required")
@@ -44,17 +47,15 @@ def lambda_handler(event, context=None):
     start = time.time()
 
     try:
-        logger.info(f"ETL stage 2 starting — account_id={account_id}, location_id={location_id}, check_stale={check_stale}")
-        results = etl_all_tables(settings.S3_BUCKET, account_id, db.engine, check_stale=check_stale)
+        logger.info(f"ETL stage 2 starting — account_id={account_id}, location_id={location_id}")
+        results = etl_all_tables(settings.S3_BUCKET, account_id, db.engine)
         elapsed = round(time.time() - start, 2)
 
         etl_success = results.get("etl_success", False)
-        stale_success = results.get("stale_update_success", True)
         failed_tables = results.get("failed_tables", [])
-        stale_results = results.get("stale_results")
-        overall_success = etl_success and stale_success
+        overall_success = etl_success
 
-        logger.info(f"ETL stage 2 done — etl={etl_success}, stale={stale_success}, "
+        logger.info(f"ETL stage 2 done — etl={etl_success}, "
                     f"failed={failed_tables}, elapsed={elapsed}s")
 
         response = {
@@ -63,23 +64,10 @@ def lambda_handler(event, context=None):
             "location_id": location_id,
             "elapsed_time_seconds": elapsed,
             "etl_success": etl_success,
-            "stale_check_enabled": check_stale,
         }
 
         if not etl_success:
             response["failed_tables"] = failed_tables
-
-        if check_stale and stale_results:
-            response["stale_update_success"] = stale_success
-            response["stale_tables"] = {
-                tbl: {
-                    "expected": r.get("expected", 0),
-                    "updated": r.get("updated", 0),
-                    "success": r.get("success", False),
-                    "elapsed_time_seconds": r.get("elapsed_time_seconds", 0),
-                }
-                for tbl, r in stale_results.get("tables", {}).items()
-            }
 
         if not overall_success:
             # Fail the invocation so Step Functions retries, then routes to a Fail

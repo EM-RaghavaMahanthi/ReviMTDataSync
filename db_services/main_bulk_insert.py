@@ -14,7 +14,9 @@ import pandas as pd
 from sqlalchemy import text
 
 from core.config import settings
-from db_services.update_stale import update_stale_data
+# Stale update removed from this stage — see etl_all_tables. It only ever covered the CRM
+# tables that TABLE_S3_CONFIG no longer stages.
+# from db_services.update_stale import update_stale_data
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +505,9 @@ def append_order_lines_to_staging(rows: list, engine) -> int:
 # ---------------------------------------------------------------------------
 
 def etl_all_tables(bucket: str, account_id: str, engine, check_stale: bool = False) -> dict:
+    # check_stale is accepted and ignored — kept so existing callers do not need editing.
+    # This stage no longer runs a stale update at all: it covered only the CRM tables that
+    # TABLE_S3_CONFIG stopped staging, so there is nothing left for it to compare.
     # ID sets local to this run — no globals
     processed_order_ids: set = set()
     ol_credit_ids: set = set()
@@ -565,24 +570,17 @@ def etl_all_tables(bucket: str, account_id: str, engine, check_stale: bool = Fal
     if failed_tables:
         logger.error(f"Failed tables: {failed_tables}")
 
+    # ── Stale update: removed ───────────────────────────────────────────────
+    # update_stale_data compared seven CRM staging tables against their main tables. All
+    # seven are in the commented-out block of TABLE_S3_CONFIG, so it has nothing to read.
+    # Kept commented rather than deleted so restoring it is uncommenting these two lines
+    # alongside the entries above.
+    #
+    # if check_stale:
+    #     stale_results = update_stale_data(engine, account_id, update=True)
+    #     stale_update_success = stale_results.get("success", False)
     stale_update_success = True
     stale_results = None
-    if check_stale:
-        # Disabled with TABLE_S3_CONFIG above. update_stale_data reads seven staging tables
-        # — mt_{class_sessions,orders,order_lines,reservations,credit_transactions,
-        # membership_transactions,membership_instances}_details_dlk — every one of which is
-        # in the commented-out block and is therefore no longer created. Running it would
-        # fail on the first query with "relation does not exist".
-        #
-        # Refusing rather than quietly skipping: CHECK_STALE_DATA being true means someone
-        # expects main tables to be updated, and silently doing nothing would be worse than
-        # saying it cannot. Uncomment the CRM tables above to restore both together.
-        logger.warning(
-            "CHECK_STALE_DATA is set, but the stale update covers only the CRM tables that "
-            "TABLE_S3_CONFIG no longer stages — skipping it. Unset CHECK_STALE_DATA, or "
-            "restore the commented entries in TABLE_S3_CONFIG if RDS onboarding is coming "
-            "back."
-        )
 
     return {
         "etl_success": len(failed_tables) == 0,
