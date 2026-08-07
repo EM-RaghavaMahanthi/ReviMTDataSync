@@ -164,7 +164,7 @@ async def step_5_insert_new_records(account_id: str, engine):
         raise
 
 
-async def process_customer_tags_default(account_id: str, engine):
+async def process_customer_tags_default(account_id: str, engine, write: bool = True):
     """Process all tags from mt_user_tags_details_dlk into customer_tags_default."""
     logger.info(f"[process_customer_tags_default] Starting for account_id={account_id}")
 
@@ -191,7 +191,13 @@ async def process_customer_tags_default(account_id: str, engine):
         if ready_to_insert == 0:
             logger.info(f"[process_customer_tags_default] No records to insert - skipping insertion step")
         else:
-            actual_inserted = await step_5_insert_new_records(account_id, engine)
+            if write:
+                actual_inserted = await step_5_insert_new_records(account_id, engine)
+            else:
+                logger.warning(
+                    f"[process_customer_tags_default] WRITE DISABLED — {ready_to_insert} rows "
+                    f"would have been inserted into customer_tags_default; inserting nothing"
+                )
 
         logger.info(
             f"[process_customer_tags_default] SUCCESS for account_id={account_id}: "

@@ -97,7 +97,7 @@ async def _upsert_staging(rows: list, account_id: str, engine) -> dict:
     return {"staging_inserted": inserted, "staging_updated": updated}
 
 
-async def run(account_id: str, engine) -> dict:
+async def run(account_id: str, engine, write: bool = True) -> dict:
     window_hours = int(os.environ.get("NOTES_WINDOW_HOURS", _DEFAULT_WINDOW_HOURS))
     max_dt = datetime.now(timezone.utc)
     min_dt = max_dt - timedelta(hours=window_hours)
@@ -123,8 +123,16 @@ async def run(account_id: str, engine) -> dict:
     )
     logger.info(f"[refresh_recent_notes] account_id={account_id}: staging {staging_stats}")
 
-    insert_result = await process_customer_notes(account_id, None, engine)
-    update_result = await update_changed_notes(account_id, engine)
+    # Staging above is always refreshed — it is scratch. `write` gates only the main
+    # customer_notes table, both the insert and the edit-propagating update.
+    insert_result = await process_customer_notes(account_id, None, engine, write=write)
+    if write:
+        update_result = await update_changed_notes(account_id, engine)
+    else:
+        logger.warning(
+            "[refresh_recent_notes] WRITE DISABLED — skipping update_changed_notes"
+        )
+        update_result = {"updated_records": 0}
 
     logger.info(
         f"[refresh_recent_notes] DONE for account_id={account_id}: "

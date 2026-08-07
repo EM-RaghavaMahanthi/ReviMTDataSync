@@ -14,22 +14,25 @@ from stg_db_services.customer_tags.base import process_customer_tags
 logger = logging.getLogger(__name__)
 
 
-async def run(account_id: str, engine) -> dict:
+async def run(account_id: str, engine, write: bool = True) -> dict:
     """
     Run customer_notes then customer_tags Stage 3 for one account.
     location_id is not needed by either — both are account_id-only (see their docstrings) —
     so we pass None rather than requiring the caller to supply one.
     """
-    logger.info(f"[backfill_notes_and_tags] Starting for account_id={account_id}")
+    logger.info(
+        f"[backfill_notes_and_tags] Starting for account_id={account_id} write={write}"
+    )
 
-    notes_result = await process_customer_notes(account_id, None, engine)
-    tags_result = await process_customer_tags(account_id, None, engine)
+    notes_result = await process_customer_notes(account_id, None, engine, write=write)
+    tags_result = await process_customer_tags(account_id, None, engine, write=write)
 
     total_inserted = notes_result["inserted_records"] + tags_result["inserted_records"]
     logger.info(
         f"[backfill_notes_and_tags] DONE for account_id={account_id}: "
         f"customer_notes={notes_result['inserted_records']}, "
-        f"customer_tags={tags_result['inserted_records']}, total={total_inserted}"
+        f"customer_tags={tags_result['inserted_records']}, total={total_inserted}, "
+        f"write={write}"
     )
 
     return {

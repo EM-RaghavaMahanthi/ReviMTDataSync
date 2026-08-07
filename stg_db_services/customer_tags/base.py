@@ -10,7 +10,7 @@ from stg_db_services.customer_tags.assignments import process_customer_tag_assig
 logger = logging.getLogger(__name__)
 
 
-async def process_customer_tags(account_id: str, location_id: int, engine):
+async def process_customer_tags(account_id: str, location_id: int, engine, write: bool = True):
     """
     Main orchestrator for customer_tags processing (tag definitions -> assignments).
     location_id is accepted for PROCESSING_ORDER's uniform call signature but unused — neither
@@ -22,7 +22,7 @@ async def process_customer_tags(account_id: str, location_id: int, engine):
     try:
         logger.info(f"[process_customer_tags] Step A: customer_tags_default (tag definitions)")
         try:
-            result_default = await process_customer_tags_default(account_id, engine)
+            result_default = await process_customer_tags_default(account_id, engine, write=write)
             results["customer_tags_default"] = result_default
             logger.info(f"[process_customer_tags] Step A SUCCESS: {result_default['inserted_records']} inserted")
         except Exception as e:
@@ -31,7 +31,7 @@ async def process_customer_tags(account_id: str, location_id: int, engine):
 
         logger.info(f"[process_customer_tags] Step B: customer_tag_assignments")
         try:
-            result_assignments = await process_customer_tag_assignments(account_id, engine)
+            result_assignments = await process_customer_tag_assignments(account_id, engine, write=write)
             results["customer_tag_assignments"] = result_assignments
             logger.info(f"[process_customer_tags] Step B SUCCESS: {result_assignments['inserted_records']} inserted")
         except Exception as e:

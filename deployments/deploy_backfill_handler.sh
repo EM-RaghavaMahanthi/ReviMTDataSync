@@ -59,23 +59,57 @@ error()   { echo "[ERROR] $*" >&2; exit 1; }
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+export AWS_PROFILE="$AWS_PROFILE"
+
+# Probe the function BEFORE resolving secrets: on an update we can reuse whatever is already
+# set on it, so a redeploy needs no local .env and no connection string on the command line.
+FUNCTION_EXISTS=true
+aws lambda get-function --function-name "$LAMBDA_NAME" > /dev/null 2>&1 || FUNCTION_EXISTS=false
+
+CURRENT_ENV='{}'
+if [ "$FUNCTION_EXISTS" = true ]; then
+    CURRENT_ENV="$(aws lambda get-function-configuration \
+        --function-name "$LAMBDA_NAME" \
+        --query 'Environment.Variables' --output json 2>/dev/null || echo '{}')"
+    if [ -z "$CURRENT_ENV" ] || [ "$CURRENT_ENV" = "null" ]; then
+        CURRENT_ENV='{}'
+    fi
+fi
+
+# Read one key out of the live function's environment (empty string if unset).
+current_env_var() { echo "$CURRENT_ENV" | jq -r --arg k "$1" '.[$k] // ""'; }
+
+# Read one key out of a local .env (empty string if the file or key is absent).
+dotenv_var() {
+    [ -f ".env" ] || return 0
+    grep -E "^$1\s*=" .env | head -1 | sed -E "s/^$1[[:space:]]*=[[:space:]]*\"?([^\"]*)\"?[[:space:]]*\$/\1/"
+}
+
 # This Lambda reads DATABASE_URL directly from the environment (see handlers/backfill/handler.py —
 # deliberately avoids core.config/core.stg_db_config, which require unrelated Auth0/S3/CRM fields
-# just to satisfy pydantic validation at import time). Default: pull the value out of local .env
-# so you don't have to paste a connection string on the command line. Override with:
+# just to satisfy pydantic validation at import time).
+#
+# Resolution order: explicit env var > local .env > whatever the deployed function already has.
+# That last fallback is what makes a plain redeploy work on a machine with no .env — the value
+# is already on the function, and re-typing a connection string just to preserve it invites a
+# typo that points production at the wrong database. Override with:
 #   DATABASE_URL="postgresql://..." ./deployments/deploy_backfill_handler.sh
-if [ -z "${DATABASE_URL:-}" ] && [ -f ".env" ]; then
-    DATABASE_URL="$(grep -E '^DATABASE_URL\s*=' .env | head -1 | sed -E 's/^DATABASE_URL[[:space:]]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+DATABASE_URL="${DATABASE_URL:-$(dotenv_var DATABASE_URL)}"
+if [ -z "$DATABASE_URL" ]; then
+    DATABASE_URL="$(current_env_var DATABASE_URL)"
+    [ -n "$DATABASE_URL" ] && info "DATABASE_URL not set locally — reusing the value already on $LAMBDA_NAME."
 fi
-[ -n "${DATABASE_URL:-}" ] || error "DATABASE_URL not set and not found in .env — set it explicitly."
+[ -n "$DATABASE_URL" ] || error "DATABASE_URL not set, not found in .env, and not already on $LAMBDA_NAME — set it explicitly."
 
 # API_KEY is only needed by the refresh_recent_notes job (calls MarianaTek directly, same
-# bearer token used everywhere else) — not by backfill_notes_and_tags. Best-effort default
-# from .env; not fatal if missing, since not every job needs it.
-if [ -z "${API_KEY:-}" ] && [ -f ".env" ]; then
-    API_KEY="$(grep -E '^API_KEY\s*=' .env | head -1 | sed -E 's/^API_KEY[[:space:]]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+# bearer token used everywhere else) — not by backfill_notes_and_tags. Same resolution order;
+# not fatal if missing, since not every job needs it.
+API_KEY="${API_KEY:-$(dotenv_var API_KEY)}"
+if [ -z "$API_KEY" ]; then
+    API_KEY="$(current_env_var API_KEY)"
+    [ -n "$API_KEY" ] && info "API_KEY not set locally — reusing the value already on $LAMBDA_NAME."
 fi
-[ -n "${API_KEY:-}" ] || info "API_KEY not set and not found in .env — refresh_recent_notes will fail until it's added."
+[ -n "$API_KEY" ] || info "API_KEY not set, not found in .env, and not already on the function — refresh_recent_notes will fail until it's added."
 
 # refresh_recent_notes's lookback window - always set explicitly as a Lambda env var (rather
 # than relying on the code's own default) so it's visible/adjustable straight from the Lambda
@@ -83,6 +117,20 @@ fi
 # back down after that). Override at deploy time:
 #   NOTES_WINDOW_HOURS=6 ./deployments/deploy_backfill_handler.sh
 NOTES_WINDOW_HOURS="${NOTES_WINDOW_HOURS:-24}"
+
+# Master write switch for this Lambda. When false (the default), every step still runs and
+# every count is still reported — only the INSERTs into customer_notes /
+# customer_tags_default / customer_tag_assignments (and refresh_recent_notes'
+# update_changed_notes) are skipped. Set explicitly so it is visible and flippable from the
+# Lambda console without a redeploy; a single event field "write": true overrides it per call.
+# Deploy with writes on:
+#   BACKFILL_WRITE_ENABLED=true ./deployments/deploy_backfill_handler.sh
+# Sticky: an explicit deploy-time value wins, otherwise keep whatever the function already
+# has, and only fall back to false on first create. Resetting it to false on every redeploy
+# would contradict "flippable from the console" — someone turns writes on, ships an unrelated
+# code change, and the backfill silently stops writing.
+BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-$(current_env_var BACKFILL_WRITE_ENABLED)}"
+BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-false}"
 
 info "Cleaning old artifacts..."
 rm -rf "$BUILD_DIR" "$ZIP_NAME"
@@ -102,18 +150,14 @@ cd ..
 ZIP_SIZE=$(du -h "$ZIP_NAME" | cut -f1)
 info "Zip: $ZIP_NAME ($ZIP_SIZE)"
 
-export AWS_PROFILE="$AWS_PROFILE"
-
-FUNCTION_EXISTS=true
-aws lambda get-function --function-name "$LAMBDA_NAME" > /dev/null 2>&1 || FUNCTION_EXISTS=false
-
 if [ "$FUNCTION_EXISTS" = false ]; then
     info "$LAMBDA_NAME does not exist — creating it (role/VPC/layers copied from revi-data-sync-stg-to-db)..."
     ENV_JSON="$(jq -nc \
         --arg db "$DATABASE_URL" \
         --arg key "$API_KEY" \
         --arg win "$NOTES_WINDOW_HOURS" \
-        '{Variables: ({DATABASE_URL: $db}
+        --arg wr "$BACKFILL_WRITE_ENABLED" \
+        '{Variables: ({DATABASE_URL: $db, BACKFILL_WRITE_ENABLED: $wr}
             + (if $key != "" then {API_KEY: $key} else {} end)
             + (if $win != "" then {NOTES_WINDOW_HOURS: $win} else {} end))}')"
 
@@ -152,18 +196,12 @@ aws lambda wait function-updated --function-name "$LAMBDA_NAME"
 info "Merging environment variables (preserving existing ones)..."
 command -v jq >/dev/null 2>&1 || error "jq is required to merge Lambda env vars — install jq or set the vars manually."
 
-CURRENT_ENV="$(aws lambda get-function-configuration \
-    --function-name "$LAMBDA_NAME" \
-    --query 'Environment.Variables' --output json 2>/dev/null || echo '{}')"
-if [ -z "$CURRENT_ENV" ] || [ "$CURRENT_ENV" = "null" ]; then
-    CURRENT_ENV='{}'
-fi
-
 ENV_JSON="$(echo "$CURRENT_ENV" | jq -c \
     --arg db "$DATABASE_URL" \
     --arg key "$API_KEY" \
     --arg win "$NOTES_WINDOW_HOURS" \
-    '{Variables: (. + {DATABASE_URL: $db}
+    --arg wr "$BACKFILL_WRITE_ENABLED" \
+    '{Variables: (. + {DATABASE_URL: $db, BACKFILL_WRITE_ENABLED: $wr}
         + (if $key != "" then {API_KEY: $key} else {} end)
         + (if $win != "" then {NOTES_WINDOW_HOURS: $win} else {} end))}')"
 
@@ -177,6 +215,6 @@ aws lambda update-function-configuration \
 
 info "Waiting for configuration update to complete..."
 aws lambda wait function-updated --function-name "$LAMBDA_NAME" \
-    && success "Done — $LAMBDA_NAME updated (handler + DATABASE_URL + API_KEY + NOTES_WINDOW_HOURS=$NOTES_WINDOW_HOURS)."
+    && success "Done — $LAMBDA_NAME updated (handler + DATABASE_URL + API_KEY + NOTES_WINDOW_HOURS=$NOTES_WINDOW_HOURS + BACKFILL_WRITE_ENABLED=$BACKFILL_WRITE_ENABLED)."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"

@@ -64,7 +64,7 @@ async def step_insert(account_id: str, engine):
         return conn.execute(insert_sql, {"account_id": account_id}).rowcount
 
 
-async def process_customer_tag_assignments(account_id: str, engine):
+async def process_customer_tag_assignments(account_id: str, engine, write: bool = True):
     """
     Insert customer_tag_assignments rows. Requires customer_tags_default to already be
     populated for this account (base.py runs it first).
@@ -73,7 +73,12 @@ async def process_customer_tag_assignments(account_id: str, engine):
 
     try:
         ready = await step_count_ready(account_id, engine)
-        inserted = await step_insert(account_id, engine) if ready else 0
+        if ready and not write:
+            logger.warning(
+                f"[process_customer_tag_assignments] WRITE DISABLED — {ready} rows would "
+                f"have been inserted into customer_tag_assignments; inserting nothing"
+            )
+        inserted = await step_insert(account_id, engine) if (ready and write) else 0
         logger.info(f"[process_customer_tag_assignments] SUCCESS for account_id={account_id}: ready={ready}, inserted={inserted}")
 
         return {

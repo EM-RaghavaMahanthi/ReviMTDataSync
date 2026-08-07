@@ -181,7 +181,7 @@ async def step_5_insert_new_records(account_id: str, engine):
         raise
 
 
-async def process_customer_notes(account_id: str, location_id: int, engine):
+async def process_customer_notes(account_id: str, location_id: int, engine, write: bool = True):
     """
     Process customer_notes from staging to final table.
     Not location-scoped (user_notes has no location filter at the CRM layer) — every
@@ -218,7 +218,13 @@ async def process_customer_notes(account_id: str, location_id: int, engine):
         if ready_to_insert == 0:
             logger.info(f"[process_customer_notes] No records to insert - skipping insertion step")
         else:
-            actual_inserted = await step_5_insert_new_records(account_id, engine)
+            if write:
+                actual_inserted = await step_5_insert_new_records(account_id, engine)
+            else:
+                logger.warning(
+                    f"[process_customer_notes] WRITE DISABLED — {ready_to_insert} rows "
+                    f"would have been inserted into customer_notes; inserting nothing"
+                )
 
         logger.info(
             f"[process_customer_notes] SUCCESS for account_id={account_id}: "

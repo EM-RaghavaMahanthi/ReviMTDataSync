@@ -15,10 +15,12 @@ utils.api_client / crm_sync.user_notes).
 Required env var: DATABASE_URL
 Required for refresh_recent_notes only: API_KEY (MarianaTek bearer token)
 Optional env var: NOTES_WINDOW_HOURS (refresh_recent_notes only - default 24, see notes_recent.py)
+Optional env var: BACKFILL_WRITE_ENABLED (default FALSE - see _resolve_write below)
 
 Event payload:
   { "event_type": "backfill_notes_and_tags", "account_id": 4809 }
   { "event_type": "refresh_recent_notes", "account_id": 4809 }
+  optional on either: "write": true   (overrides BACKFILL_WRITE_ENABLED for this call)
 """
 
 import os
@@ -32,6 +34,21 @@ from handlers.backfill import notes_and_tags, notes_recent
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+def _resolve_write(event) -> bool:
+    """
+    Whether this invocation may INSERT into the main tables. Event field wins over the env
+    var, matching the update/BULK_UPDATE precedence in the bulk pipeline: the deployed env
+    var is the safe default, a caller who means it says so per-call.
+
+    Defaults to FALSE. Every count still runs when disabled, so a dry invocation reports
+    exactly what it would have written — which is the point: run it, read the numbers,
+    then re-run with "write": true.
+    """
+    if "write" in event:
+        return bool(event["write"])
+    return os.environ.get("BACKFILL_WRITE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
 
 _EVENT_HANDLERS = {
     "backfill_notes_and_tags": notes_and_tags.run,
@@ -68,13 +85,23 @@ async def async_lambda_handler(event, context=None):
     if not database_url:
         return {"status": "error", "error": "DATABASE_URL environment variable is required"}
 
-    logger.info(f"[backfill] event_type={event_type} account_id={account_id} starting")
+    write = _resolve_write(event)
+    logger.info(
+        f"[backfill] event_type={event_type} account_id={account_id} write={write} starting"
+    )
+    if not write:
+        logger.warning(
+            "[backfill] WRITE DISABLED — counting only, no rows will be inserted into "
+            "customer_notes / customer_tags_default / customer_tag_assignments. "
+            'Set BACKFILL_WRITE_ENABLED=true or pass "write": true to enable.'
+        )
     engine = create_engine(database_url)
 
     try:
-        result = await handler(account_id, engine)
+        result = await handler(account_id, engine, write=write)
         logger.info(f"[backfill] event_type={event_type} account_id={account_id} SUCCESS")
-        return {"status": "success", "event_type": event_type, "account_id": account_id, **result}
+        return {"status": "success", "event_type": event_type, "account_id": account_id,
+                "write_enabled": write, **result}
     except Exception as e:
         logger.error(f"[backfill] event_type={event_type} account_id={account_id} FAILED: {e}")
         return {"status": "error", "event_type": event_type, "account_id": account_id, "error": str(e)}
