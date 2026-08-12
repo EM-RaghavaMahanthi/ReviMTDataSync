@@ -116,6 +116,10 @@ fi
 # console without a redeploy. 24h for now (per-request, temporary for the first run - drop
 # back down after that). Override at deploy time:
 #   NOTES_WINDOW_HOURS=6 ./deployments/deploy_backfill_handler.sh
+# Also read from .env — same reason as the write switch below: a value sitting in .env that
+# the deploy ignores is a trap. No function fallback here on purpose; this one is meant to be
+# re-stated every deploy so it doesn't quietly stay wide open.
+NOTES_WINDOW_HOURS="${NOTES_WINDOW_HOURS:-$(dotenv_var NOTES_WINDOW_HOURS)}"
 NOTES_WINDOW_HOURS="${NOTES_WINDOW_HOURS:-24}"
 
 # Master write switch for this Lambda. When false (the default), every step still runs and
@@ -123,12 +127,19 @@ NOTES_WINDOW_HOURS="${NOTES_WINDOW_HOURS:-24}"
 # customer_tags_default / customer_tag_assignments (and refresh_recent_notes'
 # update_changed_notes) are skipped. Set explicitly so it is visible and flippable from the
 # Lambda console without a redeploy; a single event field "write": true overrides it per call.
-# Deploy with writes on:
+# Deploy with writes on, either way:
 #   BACKFILL_WRITE_ENABLED=true ./deployments/deploy_backfill_handler.sh
-# Sticky: an explicit deploy-time value wins, otherwise keep whatever the function already
-# has, and only fall back to false on first create. Resetting it to false on every redeploy
-# would contradict "flippable from the console" — someone turns writes on, ships an unrelated
-# code change, and the backfill silently stops writing.
+#   or set BACKFILL_WRITE_ENABLED=true in .env
+#
+# Resolution: explicit shell var > .env > whatever is already on the function > false.
+# .env is read here for the same reason DATABASE_URL and API_KEY are — a value sitting in
+# .env that the deploy silently ignores is worse than no value at all.
+#
+# Sticky via the function fallback: an unrelated redeploy keeps whatever writes setting is
+# live rather than resetting it to false, which would contradict "flippable from the
+# console" — someone turns writes on, ships a code change, and the backfill silently stops
+# writing. Only a first create falls through to false.
+BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-$(dotenv_var BACKFILL_WRITE_ENABLED)}"
 BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-$(current_env_var BACKFILL_WRITE_ENABLED)}"
 BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-false}"
 

@@ -70,17 +70,28 @@ async def step_3b_count_missing_customers(account_id: str, engine):
     Step 3b: Count staging rows whose customer_id has no matching row in `customers` for
     this account (removed/merged/never-synced customer) — these are legitimately excluded
     by step_4/step_5's INNER JOIN, not a bug, so they must be subtracted from the expected
-    count. Same pattern as credit_transactions.py's step_3_count_transactions_with_missing_customers.
+    count.
+
+    Scoped to rows NOT already in the main table. The three exclusion counts (3, 3b, 3c) are
+    subtracted from the total, so they have to partition the staging set rather than merely
+    cover it: a row that is both already-in-main and missing-customer would otherwise be
+    subtracted twice and the validation below would fail on healthy data. Precedence is
+    3 > 3b > 3c, mirroring the order step_4 applies the same predicates.
     """
     logger.info(f"[STEP 3b] Counting staging rows with no matching customer")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(*) as count
                 FROM mt_user_notes_details_dlk stg
                 LEFT JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
                 WHERE stg.account_id = :account_id
                   AND c.customer_id IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM {_TABLE} cn
+                    WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
+                      AND cn.note_id = stg.note_id
+                  )
             """), {"account_id": account_id})
             missing_count = result.fetchone()[0]
         if missing_count > 0:
@@ -97,15 +108,27 @@ async def step_3c_count_null_notes(account_id: str, engine):
     Step 3c: Count staging rows where note text is NULL (MarianaTek sent no `text`
     attribute) — customer_notes.note is NOT NULL, so these are excluded by step_4/step_5's
     filter rather than crashing the whole insert batch. Subtracted from the expected count.
+
+    Last in the precedence chain (see step_3b), so it counts only rows that are not already
+    in the main table AND do have a matching customer. Without those two conditions a row
+    that is both missing-customer and null-note lands in two buckets and gets subtracted
+    twice — the exact cause of "Count mismatch! Expected 1990, got 1995" on account 5172,
+    where 5 rows carried a deleted customer and no note text.
     """
     logger.info(f"[STEP 3c] Counting staging rows with null note text")
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(text(f"""
                 SELECT COUNT(*) as count
                 FROM mt_user_notes_details_dlk stg
+                INNER JOIN customers c ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
                 WHERE stg.account_id = :account_id
                   AND stg.note IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM {_TABLE} cn
+                    WHERE cn.account_id = stg.account_id AND cn.customer_id = stg.customer_id
+                      AND cn.note_id = stg.note_id
+                  )
             """), {"account_id": account_id})
             null_count = result.fetchone()[0]
         if null_count > 0:
@@ -210,8 +233,17 @@ async def process_customer_notes(account_id: str, location_id: int, engine, writ
         null_note_records = await step_3c_count_null_notes(account_id, engine)
         ready_to_insert = await step_4_count_records_to_insert(account_id, engine)
 
+        # Steps 3/3b/3c PARTITION the staging set (each is scoped to exclude the ones before
+        # it), so the subtraction is exact and any remaining mismatch is a real problem —
+        # most likely duplicate (account_id, customer_id) rows in `customers`, which fan the
+        # INNER JOIN out and would make step_5 insert the same note more than once.
         expected_ready = total_staging - already_exist_in_main - missing_customer_records - null_note_records
-        logger.info(f"[process_customer_notes] Pre-insertion validation: expected={expected_ready}, actual={ready_to_insert}")
+        logger.info(
+            f"[process_customer_notes] Pre-insertion validation: expected={expected_ready}, "
+            f"actual={ready_to_insert} "
+            f"(staging={total_staging} - already_exist={already_exist_in_main} "
+            f"- missing_customer={missing_customer_records} - null_note={null_note_records})"
+        )
         if ready_to_insert != expected_ready:
             raise Exception(f"Count mismatch! Expected {expected_ready}, got {ready_to_insert}. Manual review required.")
 
