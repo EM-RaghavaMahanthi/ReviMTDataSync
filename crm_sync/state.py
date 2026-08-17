@@ -155,6 +155,49 @@ async def plan_user_shards(
     return shards
 
 
+async def plan_customer_id_shards(account_id, location_id, api_base_url) -> list:
+    """
+    Backfill-only: shard `customers` over the ids RDS already holds, instead of paginating
+    /users by home_location.
+
+    Stage 3 inserts nothing for a customer absent from RDS — every path INNER JOINs
+    `customers` — so fetching by home_location downloads records that are discarded further
+    down. RDS is also account-scoped where home_location is location-scoped, so a
+    multi-location account needs one pass here rather than one per location.
+
+    The id list goes to S3 and the shards carry offsets, reusing the transaction path
+    verbatim: _handle_id_batch_shard already reads its slice from there, so no shard-side
+    change is needed. It also keeps a failed shard re-runnable without re-querying RDS.
+    """
+    from utils.db_ids import read_customer_ids_from_rds
+    from utils.s3_writer import write_id_list_to_s3
+
+    ids = await read_customer_ids_from_rds(account_id)
+    if not ids:
+        raise RuntimeError(
+            f"customers: RDS holds no customers for account_id={account_id}. Refusing to plan "
+            f"an empty backfill — notes and tags would resolve against nothing and the run "
+            f"would still report success."
+        )
+
+    batch_size = int(getattr(settings, "MAX_CUSTOMER_IDS", 800))
+    ids_per_shard = _REQUESTS_PER_SHARD * batch_size
+
+    await write_id_list_to_s3(account_id, location_id, "customers", ids)
+
+    base = {"account_id": account_id, "location_id": location_id, "api_base_url": api_base_url}
+    shards = [
+        {**base, "mode": "id_batch_shard", "resource": "customers",
+         "id_offset": offset, "id_limit": ids_per_shard}
+        for offset in range(0, len(ids), ids_per_shard)
+    ]
+    logger.info(
+        f"[plan] customers: {len(ids)} RDS ids -> {len(shards)} shards "
+        f"({-(-len(ids) // batch_size)} requests total)"
+    )
+    return shards
+
+
 async def plan_transaction_shards(
     account_id, location_id, api_base_url, tables: list = None,
 ) -> list:

@@ -19,6 +19,7 @@ SOURCE_DIRS=("core" "clients" "handlers" "crm_sync" "schemas" "utils")
 #   USER_BATCHES_PER_SHARD=10 ./deployments/deploy_crm_to_s3.sh
 PAGE_SIZE="${PAGE_SIZE:-200}"                                 # records per page; MT allows up to 500
 MAX_IDS="${MAX_IDS:-200}"                                     # ids per filter[id] call (id_batch resources)
+MAX_CUSTOMER_IDS="${MAX_CUSTOMER_IDS:-800}"                   # ids per filter[id] call on /users — measured limit
 CRM_MAX_REQUESTS_PER_MIN="${CRM_MAX_REQUESTS_PER_MIN:-100}"   # token bucket = 50% of the 200/min ceiling
 PAGES_PER_SHARD="${PAGES_PER_SHARD:-200}"                     # pages per location/user page-range shard
 USER_BATCHES_PER_SHARD="${USER_BATCHES_PER_SHARD:-20}"        # 100-user batches per user_batch shard (~2 min/shard)
@@ -80,6 +81,7 @@ fi
 ENV_JSON="$(echo "$CURRENT_ENV" | jq -c \
     --arg ps  "$PAGE_SIZE" \
     --arg mid "$MAX_IDS" \
+    --arg mcid "$MAX_CUSTOMER_IDS" \
     --arg rpm "$CRM_MAX_REQUESTS_PER_MIN" \
     --arg pps "$PAGES_PER_SHARD" \
     --arg ubs "$USER_BATCHES_PER_SHARD" \
@@ -91,6 +93,7 @@ ENV_JSON="$(echo "$CURRENT_ENV" | jq -c \
     (. + {
         PAGE_SIZE: $ps,
         MAX_IDS: $mid,
+        MAX_CUSTOMER_IDS: $mcid,
         CRM_MAX_REQUESTS_PER_MIN: $rpm,
         PAGES_PER_SHARD: $pps,
         USER_BATCHES_PER_SHARD: $ubs,
@@ -120,6 +123,6 @@ aws lambda update-function-configuration \
 
 info "Waiting for configuration update to complete..."
 aws lambda wait function-updated --function-name "$LAMBDA_NAME" \
-    && success "Done — $LAMBDA_NAME updated (handler + env: PAGE_SIZE=$PAGE_SIZE, MAX_IDS=$MAX_IDS, CRM_MAX_REQUESTS_PER_MIN=$CRM_MAX_REQUESTS_PER_MIN, PAGES_PER_SHARD=$PAGES_PER_SHARD, USER_BATCHES_PER_SHARD=$USER_BATCHES_PER_SHARD, CONCURRENCY_LIMIT=$CONCURRENCY_LIMIT, USER_NOTES_S3_PREFIX=$USER_NOTES_S3_PREFIX, USER_TAGS_S3_PREFIX=$USER_TAGS_S3_PREFIX, CUSTOMER_TAGS_S3_PREFIX=$CUSTOMER_TAGS_S3_PREFIX)."
+    && success "Done — $LAMBDA_NAME updated (handler + env: PAGE_SIZE=$PAGE_SIZE, MAX_IDS=$MAX_IDS, MAX_CUSTOMER_IDS=$MAX_CUSTOMER_IDS, CRM_MAX_REQUESTS_PER_MIN=$CRM_MAX_REQUESTS_PER_MIN, PAGES_PER_SHARD=$PAGES_PER_SHARD, USER_BATCHES_PER_SHARD=$USER_BATCHES_PER_SHARD, CONCURRENCY_LIMIT=$CONCURRENCY_LIMIT, USER_NOTES_S3_PREFIX=$USER_NOTES_S3_PREFIX, USER_TAGS_S3_PREFIX=$USER_TAGS_S3_PREFIX, CUSTOMER_TAGS_S3_PREFIX=$CUSTOMER_TAGS_S3_PREFIX)."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"

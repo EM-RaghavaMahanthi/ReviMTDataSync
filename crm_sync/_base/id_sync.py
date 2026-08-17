@@ -52,10 +52,19 @@ async def run(
     batch_size: int = None,
     concurrency_limit: int = None,
     parquet_batch_size: int = None,
+    side_map_fn=None,
+    side_s3_prefix: str = None,
+    side_entity_type: str = "side",
 ) -> tuple[int, int]:
     """
     Fetch `ids` in chunks via filter[id], write the mapped rows to S3.
     Returns (total_processed, total_fetched).
+
+    Optional side output, mirroring location_sync: if side_map_fn is given, each chunk's RAW
+    response is passed to side_map_fn(resp, account_id, entity_id, api_base_url) -> list[dict]
+    and those rows are written to side_s3_prefix. `customers` needs this — customer→tag
+    assignments have no endpoint of their own and exist only inside the /users response, so a
+    fetch path without the side output would silently stop writing them.
     """
     tag = resource.upper()
     start_time = time.time()
@@ -106,17 +115,27 @@ async def run(
                 f"this would silently fetch the whole tenant."
             )
 
+        side_rows = []
+        if side_map_fn is not None and resp:
+            try:
+                side_rows = side_map_fn(resp, account_id, location_id, api_base_url)
+            except Exception as e:
+                # Match location_sync: a broken side mapper must not lose the main rows.
+                logger.error(f"[{tag}] side_map_fn failed on a chunk: {e}")
+
         done += 1
         if done % 20 == 0:
             logger.info(f"[{tag}] {done}/{len(chunks)} requests done")
-        return chunk_rows, returned
+        return chunk_rows, returned, side_rows
 
     results = await asyncio.gather(*[fetch_one(c) for c in chunks])
 
     rows = []
+    side_rows = []
     total_fetched = 0
-    for chunk_rows, returned in results:
+    for chunk_rows, returned, chunk_side in results:
         rows.extend(chunk_rows)
+        side_rows.extend(chunk_side)
         total_fetched += returned
 
     # Ids we asked for and did not get back. Expected in small numbers — a transaction
@@ -141,9 +160,22 @@ async def run(
         total_processed += len(chunk)
         file_num += 1
 
+    if side_rows and side_s3_prefix:
+        side_num = 1
+        for chunk in _chunks(side_rows, parquet_batch_size):
+            if not chunk:
+                continue
+            await write_parquet_to_s3(
+                chunk, shard_tag or str(location_id), side_num, account_id,
+                s3_prefix=side_s3_prefix, entity_type=side_entity_type,
+            )
+            side_num += 1
+        logger.info(f"[{tag}] side output: {len(side_rows)} rows -> {side_entity_type}")
+
     elapsed = time.time() - start_time
+    side_note = f", side_rows={len(side_rows)}" if side_map_fn else ""
     logger.info(
         f"[{tag}] DONE: requested={len(ids)}, fetched={total_fetched}, "
-        f"written={total_processed}, elapsed={elapsed:.2f}s"
+        f"written={total_processed}{side_note}, elapsed={elapsed:.2f}s"
     )
     return total_processed, total_fetched

@@ -270,18 +270,40 @@ async def _handle_backfill_plan(body: dict) -> dict:
 
     # Scoped stale-clear: only the datasets this backfill writes (customers + its
     # customer_tags side output + user_notes + user_tags).
-    from utils.s3_writer import delete_account_prefix
+    from utils.s3_writer import delete_account_prefix, ID_LIST_PREFIX
     clear_keys = set(_BACKFILL_LOCATION_TABLES) | set(_BACKFILL_USER_TABLES) | {"customer_tags"}
     for key in clear_keys:
         prefix = settings.S3_PREFIXES.get(key)
         if prefix:
             await delete_account_prefix(account_id, prefix)
+    # This flow now writes a customers id list too, so clear it like the main plan does —
+    # otherwise a list from an earlier run under a different location_id lingers.
+    await delete_account_prefix(account_id, ID_LIST_PREFIX)
 
-    from crm_sync.state import plan_location_shards, plan_user_shards
+    # customers by id, not by home_location. Stage 3 inserts nothing for a customer absent
+    # from RDS — every path INNER JOINs `customers` — so paginating home_location downloads
+    # records that are discarded downstream. RDS is also account-scoped where home_location
+    # is location-scoped, so this covers a multi-location account in one pass.
+    #
+    # These come back as mode=id_batch_shard but still travel under "location_shards": the
+    # state machine's Map only forwards each item to the Lambda, which dispatches on `mode`,
+    # so no ASL change is needed.
+    from crm_sync.state import plan_customer_id_shards, plan_user_shards
     location_shards, user_shards = await asyncio.gather(
-        plan_location_shards(account_id, location_id, api_base_url, tables=_BACKFILL_LOCATION_TABLES),
+        plan_customer_id_shards(account_id, location_id, api_base_url),
         plan_user_shards(account_id, location_id, api_base_url, tables=_BACKFILL_USER_TABLES),
     )
+
+    # These accounts are already onboarded and the bulk pipeline keeps RDS customers current,
+    # so RDS is the authoritative customer set — not whatever this run's /users pagination
+    # happened to return. Stamped only on the backfill's shards; onboarding's planner never
+    # sets the field and keeps reading the parquet.
+    #
+    # Also decouples the notes shards from the customers shards, which previously had to
+    # finish and write parquet first.
+    for shard in user_shards:
+        if shard.get("mode") == "user_shard":
+            shard["customer_id_source"] = "rds"
     logger.info(f"[backfill_plan] account={account_id}: {len(location_shards)} location + {len(user_shards)} user shards")
     return {
         "status": "success",
@@ -340,16 +362,43 @@ async def _handle_tenant_shard(body: dict) -> dict:
 
 
 async def _handle_user_shard(body: dict) -> dict:
-    """mode=user_shard — unfiltered page range for membership_instances, filtered by customer_ids."""
-    from utils.s3_writer import read_customer_ids_from_s3
+    """
+    mode=user_shard — unfiltered page range for membership_instances / user_notes, kept only
+    for rows whose customer_id is in this account's customer set.
+
+    customer_id_source picks where that set comes from:
+      "s3"  (default) — the customers parquet this run just wrote. Onboarding's path; the
+                        customers download is the only source of truth there.
+      "rds"           — the customers table, which the bulk pipeline keeps populated. Used by
+                        the notes/tags backfill, where the account is already onboarded and
+                        RDS is authoritative.
+
+    Defaulted so onboarding cannot change: it never sets the field.
+    """
     resource = body["resource"]
     account_id = body["account_id"]
     location_id = body["location_id"]
     api_base_url = body["api_base_url"]
     page_start = int(body["page_start"])
     page_end = int(body["page_end"])
+    id_source = body.get("customer_id_source", "s3")
 
-    customer_ids = await read_customer_ids_from_s3(account_id)
+    if id_source == "rds":
+        from utils.db_ids import read_customer_ids_from_rds
+        customer_ids = await read_customer_ids_from_rds(account_id)
+        # Fail rather than write an empty result. An empty filter set keeps every row out
+        # while the shard still reports success — a run that syncs nothing and looks fine.
+        if not customer_ids:
+            raise RuntimeError(
+                f"{resource}: RDS holds no customers for account_id={account_id}. Refusing to "
+                f"run with an empty filter set — every row would be discarded and the shard "
+                f"would still report success."
+            )
+    elif id_source == "s3":
+        from utils.s3_writer import read_customer_ids_from_s3
+        customer_ids = await read_customer_ids_from_s3(account_id)
+    else:
+        raise ValueError(f"unknown customer_id_source '{id_source}' (expected 's3' or 'rds')")
     mod = importlib.import_module(f"crm_sync.{resource}")
     processed, fetched = await mod.process_unfiltered_shard(
         account_id, location_id, api_base_url, customer_ids, page_start, page_end

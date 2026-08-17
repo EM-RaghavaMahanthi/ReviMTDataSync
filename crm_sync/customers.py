@@ -21,12 +21,35 @@ async def fetch_page(location_id: str, page: int, account_id: str, api_base_url:
     page_size = getattr(settings, "PAGE_SIZE", 500)
     params = {"home_location": location_id, "page": page, "page_size": page_size}
     resp = await api_get("/users", api_base_url, params)
+    return _map_response(resp, location_id, account_id), resp
 
+
+async def fetch_by_ids(ids: list, account_id: str, api_base_url: str, location_id=None):
+    """
+    Fetch exactly these users via one comma-joined filter[id]. Signature matches what
+    crm_sync/_base/id_sync.py expects: (ids, account_id, api_base_url, location_id).
+
+    Used by the notes/tags backfill, where RDS already holds the authoritative customer set
+    and Stage 3 discards anything outside it anyway (its INNER JOIN customers), so paginating
+    by home_location downloads records that are thrown away.
+
+    /users accepts up to MAX_CUSTOMER_IDS (800) per call — more than the 200 the transaction
+    endpoints take.
+    """
+    params = {"filter[id]": ",".join(str(i) for i in ids), "page_size": len(ids)}
+    resp = await api_get("/users", api_base_url, params)
+    return _map_response(resp, location_id, account_id), resp
+
+
+def _map_response(resp, location_id, account_id):
+    """Map a /users response body to Customer rows. Shared by both fetch paths."""
     from schemas.revi_schema import Customer
     crm_downloaded_at = datetime.now(timezone.utc)
     valid = []
 
-    for u in resp.get("data", []):
+    # `or []` not a .get default: a filter[id] response can carry an explicit null where a
+    # paginated one has a list, and the default only applies to a MISSING key.
+    for u in (resp.get("data") or []):
         attrs = u.get("attributes", {})
 
         birth_date = attrs.get("birth_date")
@@ -76,8 +99,8 @@ async def fetch_page(location_id: str, page: int, account_id: str, api_base_url:
         except Exception as e:
             logger.warning(f"[customers] Skipping customer id={u.get('id')}: {e}")
 
-    logger.info(f"[customers] location={location_id} page={page}: {len(valid)} valid records")
-    return valid, resp
+    logger.info(f"[customers] location={location_id}: {len(valid)} valid records")
+    return valid
 
 
 def _extract_tag_assignments(resp, account_id, location_id, api_base_url):
@@ -123,6 +146,33 @@ SIDE_ENTITY_TYPE = "customer_tags"
 
 def side_s3_prefix():
     return settings.S3_PREFIXES.get("customer_tags", "mariana-tek/customer_tags-details")
+
+
+async def process_id_shard(
+    ids: list, account_id: str, location_id, api_base_url: str, shard_tag: str = None,
+) -> tuple[int, int]:
+    """
+    'id_batch_shard' entry point for customers — fetch exactly this slice of RDS ids.
+
+    Carries the tag-assignment side output through, exactly as process_for_location does.
+    Without it the /users records would still be written but customer_tag_assignments would
+    silently stop being produced, since relationships.tags is their only source.
+    """
+    from crm_sync._base import id_sync
+    return await id_sync.run(
+        resource=_RESOURCE,
+        fetch_by_ids_fn=fetch_by_ids,
+        ids=ids,
+        account_id=account_id,
+        location_id=location_id,
+        api_base_url=api_base_url,
+        s3_prefix=settings.S3_PREFIXES["customers"],
+        shard_tag=shard_tag,
+        batch_size=int(getattr(settings, "MAX_CUSTOMER_IDS", 800)),
+        side_map_fn=SIDE_MAP_FN,
+        side_s3_prefix=side_s3_prefix(),
+        side_entity_type=SIDE_ENTITY_TYPE,
+    )
 
 
 async def process_for_location(

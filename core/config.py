@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     # many ids fit in a URL", and they are limited by different things.
     MAX_IDS: int = 200
 
+    # Ids per filter[id] call for /users. Higher than MAX_IDS because /users was measured to
+    # accept up to 800, while 200 is the tested value on the transaction endpoints — kept
+    # separate rather than raised globally so confirming one does not silently change the
+    # other.
+    MAX_CUSTOMER_IDS: int = 800
+
     # Per-tenant request rate cap (50% of MarianaTek's 200 req/min ceiling — headroom
     # for the in-process token bucket in utils/api_client.py). Read there via os.environ.
     CRM_MAX_REQUESTS_PER_MIN: int = 100
