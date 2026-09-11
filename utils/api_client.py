@@ -115,10 +115,26 @@ async def close_session() -> None:
 # ─── Fetch ────────────────────────────────────────────────────────────────────
 
 def _should_retry(exc: BaseException) -> bool:
-    """Retry on server errors and rate limits, but not other 4xx (e.g. 404)."""
+    """
+    Retry on server errors, rate limits and timeouts, but not other 4xx (e.g. 404).
+
+    asyncio.TimeoutError, not aiohttp.ServerTimeoutError, is what the ClientTimeout(total=...)
+    below actually raises — aiohttp ends at `raise asyncio.TimeoutError` in helpers.py. And
+    ServerTimeoutError SUBCLASSES asyncio.TimeoutError, not the other way round, so a predicate
+    naming only ServerTimeoutError returns False for every total-timeout and tenacity never
+    retries the one failure the retry policy exists for.
+
+    That is not hypothetical: it took out 10 of 82 accounts on the 2026-09-11 notes/tags
+    backfill. Each died on a single slow /users?filter[id] response while the accounts that
+    succeeded fetched 4840 ids in 7 requests in 8 seconds — transient server slowness, retried
+    away by every other path in this codebase, fatal only here because id_sync has no DLQ.
+
+    asyncio.TimeoutError covers ServerTimeoutError by inheritance, so it is the only timeout
+    class worth naming.
+    """
     if isinstance(exc, aiohttp.ClientResponseError):
         return exc.status >= 500 or exc.status == 429
-    return isinstance(exc, (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError))
+    return isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError))
 
 
 _DEFAULT_RETRY_AFTER = 10  # seconds to wait on 429 when Retry-After header is absent
