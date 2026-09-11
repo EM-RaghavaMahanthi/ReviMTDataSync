@@ -1,0 +1,370 @@
+{
+  "Comment": "Notes & tags BACKFILL for older accounts. Stage0 resolves accounts, then per-account Backfill_Plan (mode=backfill_plan) fetches ONLY customers + user_notes + user_tags from the CRM. Stage 2 (revi-crm-db-sync) loads the mt_*_details_dlk staging tables; Stage 3 (revi-backfill, event_type=backfill_notes_and_tags) populates ONLY customer_notes + customer_tags_default + customer_tag_assignments. ISOLATION: a failing account must NOT stop the rest. ToleratedFailurePercentage does not do that here \u2014 it is a DISTRIBUTED Map field and this ItemProcessor is INLINE, so it was silently inert; a run over 82 accounts started one iteration, hit a Fail state, and the whole Map aborted. Instead every per-account failure path now ends in a Pass state carrying status=FAILED, so no iteration ever fails and the Map always runs every account. The trade: the execution reports SUCCEEDED even when accounts failed, so read per-account `status` in results \u2014 do not read the execution's own status as 'everything worked'.",
+  "StartAt": "GetAccountsDetails",
+  "States": {
+    "GetAccountsDetails": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-data-fixes-temp",
+      "Parameters": {
+        "event_type": "get_all_accounts_details",
+        "account_ids.$": "$.accounts"
+      },
+      "ResultPath": "$.stage0_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "CheckStage0Status",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Stage0Failed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "CheckStage0Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.stage0_result.status",
+          "StringEquals": "success",
+          "Next": "ProcessAllAccounts"
+        }
+      ],
+      "Default": "Stage0Failed"
+    },
+    "Stage0Failed": {
+      "Type": "Fail",
+      "Error": "Stage0Failed",
+      "Cause": "Stage 0 failed - could not retrieve account details"
+    },
+    "ProcessAllAccounts": {
+      "Type": "Map",
+      "MaxConcurrency": 1,
+      "ItemsPath": "$.stage0_result.data.accounts_details",
+      "ItemSelector": {
+        "account_id.$": "$$.Map.Item.Value.account_id",
+        "location_id.$": "$$.Map.Item.Value.location_id",
+        "api_base_url.$": "$$.Map.Item.Value.api_base_url"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Backfill_Plan",
+        "States": {
+          "Backfill_Plan": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+            "Parameters": {
+              "mode": "backfill_plan",
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "api_base_url.$": "$.api_base_url"
+            },
+            "ResultPath": "$.plan",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "Backfill_LocationMap",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "BackfillFailed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Backfill_LocationMap": {
+            "Type": "Map",
+            "MaxConcurrency": 1,
+            "ItemsPath": "$.plan.location_shards",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "LocationShard",
+              "States": {
+                "LocationShard": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 5,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "MaxDelaySeconds": 60,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": null,
+            "Next": "Backfill_UserMap",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "BackfillFailed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Backfill_UserMap": {
+            "Type": "Map",
+            "MaxConcurrency": 1,
+            "ItemsPath": "$.plan.user_shards",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "UserShard",
+              "States": {
+                "UserShard": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-syncdata-test",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 5,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "MaxDelaySeconds": 60,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": null,
+            "Next": "Stage2_S3ToStagingDb",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "BackfillFailed",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "Stage2_S3ToStagingDb": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-crm-db-sync",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id"
+            },
+            "ResultPath": "$.stage2_result",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "CheckStage2Status",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage2Error",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "CheckStage2Status": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.stage2_result.status",
+                "StringEquals": "success",
+                "Next": "Stage3_NotesTagsBackfill"
+              }
+            ],
+            "Default": "Stage2Failed"
+          },
+          "Stage2Failed": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "FAILED",
+              "stage": "stage2_s3_to_staging",
+              "message": "S3->staging returned a non-success status",
+              "stage2_result.$": "$.stage2_result"
+            },
+            "End": true
+          },
+          "Stage3_NotesTagsBackfill": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-backfill",
+            "Parameters": {
+              "event_type": "backfill_notes_and_tags",
+              "account_id.$": "$.account_id"
+            },
+            "ResultPath": "$.stage3_result",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "CheckStage3Status",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Stage3Error",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "CheckStage3Status": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.stage3_result.status",
+                "StringEquals": "success",
+                "Next": "AccountBackfillSuccess"
+              }
+            ],
+            "Default": "Stage3Failed"
+          },
+          "Stage3Failed": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "FAILED",
+              "stage": "stage3_staging_to_main",
+              "message": "notes/tags backfill returned a non-success status",
+              "stage3_result.$": "$.stage3_result"
+            },
+            "End": true
+          },
+          "BackfillFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "FAILED",
+              "stage": "stage1_crm_to_s3",
+              "message": "CRM->S3 plan or shard failed",
+              "error.$": "$.error"
+            },
+            "End": true
+          },
+          "AccountBackfillSuccess": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "SUCCESS",
+              "message": "Notes & tags backfill completed through Stage 3 (main DB) for this account"
+            },
+            "End": true
+          },
+          "Stage2Error": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "FAILED",
+              "stage": "stage2_s3_to_staging",
+              "message": "S3->staging lambda raised",
+              "error.$": "$.error"
+            },
+            "End": true
+          },
+          "Stage3Error": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "location_id.$": "$.location_id",
+              "status": "FAILED",
+              "stage": "stage3_staging_to_main",
+              "message": "notes/tags backfill lambda raised",
+              "error.$": "$.error"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "FinalSummary"
+    },
+    "FinalSummary": {
+      "Type": "Pass",
+      "Parameters": {
+        "workflow_status": "COMPLETED",
+        "execution_name.$": "$$.Execution.Name",
+        "accounts_attempted.$": "States.ArrayLength($)",
+        "note": "Every account ran. Check each result's `status` field \u2014 FAILED accounts are in here too, not dropped.",
+        "results.$": "$"
+      },
+      "End": true
+    }
+  }
+}
