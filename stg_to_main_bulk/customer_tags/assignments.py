@@ -1,8 +1,10 @@
 """
 customer_tag_assignments — links a customer to a tag definition in customer_tags_default.
-custom_tag_id always stays NULL for CRM-sourced tags (customer_tags_custom is no longer
-populated by this sync — reserved for a future feature where staff create tags directly in our
-product, not sourced from MT).
+custom_tag_id and the customer_tags_custom model were dropped from the backend schema in its
+Group Tag work (Revi-backend 776c0389, 2026-08-13), so this insert no longer names the column —
+against a migrated database it would fail with "column custom_tag_id does not exist".
+The bulk staging table stg_customer_tags_bulk still carries the column; it is ours, always NULL,
+and simply unused now.
 
 Resolves default_tag_id via customer_tags_default(tenant_name, crm_tag_id) — matching the Prisma
 @@unique([customer_ref_id, default_tag_id]) constraint.
@@ -42,11 +44,11 @@ async def step_count_ready(account_id: str, engine):
 async def step_insert(account_id: str, engine):
     insert_sql = text(f"""
         INSERT INTO public.{_ASSIGNMENTS_TABLE} (
-          account_id, customer_ref_id, customer_id, custom_tag_id, default_tag_id, created_at, created_by
+          account_id, customer_ref_id, customer_id, default_tag_id, created_at, created_by
         )
         SELECT DISTINCT
           stg.account_id, c.id AS customer_ref_id, stg.customer_id,
-          NULL::integer AS custom_tag_id, def.id AS default_tag_id, NOW(), -1
+          def.id AS default_tag_id, NOW(), -1
         FROM stg_customer_tags_bulk stg
         INNER JOIN stg_user_tags_bulk ut
           ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id

@@ -1,8 +1,9 @@
 """
 customer_tag_assignments — links a customer to a tag definition in customer_tags_default.
-custom_tag_id always stays NULL for CRM-sourced tags (customer_tags_custom is no longer
-populated by this sync — reserved for a future feature where staff create tags directly in our
-product, not sourced from MT).
+The schema dropped custom_tag_id and the customer_tags_custom model entirely in the backend's
+Group Tag work (Revi-backend 776c0389, 2026-08-13). This insert used to write
+`NULL::integer AS custom_tag_id`; against a migrated database that fails outright with
+"column custom_tag_id does not exist", so it is gone from the column list here too.
 
 Resolves default_tag_id via customer_tags_default(tenant_name, crm_tag_id) — matching the Prisma
 @@unique([customer_ref_id, default_tag_id]) constraint.
@@ -38,8 +39,8 @@ async def step_count_breakdown(account_id: str, engine) -> dict:
     named buckets instead of leaving it as an unexplained gap.
 
     DISTINCT is on (customer_ref_id, customer_id, default_tag_id) rather than
-    (customer_id, default_tag_id) to match the insert exactly: account_id and custom_tag_id
-    are constants, but customer_ref_id is NOT functionally determined by customer_id if
+    (customer_id, default_tag_id) to match the insert exactly: account_id is constant, but
+    customer_ref_id is NOT functionally determined by customer_id if
     `customers` holds duplicate (account_id, customer_id) rows — in which case the insert
     genuinely does write one assignment per duplicate, and the count must say so too.
     """
@@ -93,11 +94,11 @@ async def step_count_breakdown(account_id: str, engine) -> dict:
 async def step_insert(account_id: str, engine):
     insert_sql = text(f"""
         INSERT INTO public.{_ASSIGNMENTS_TABLE} (
-          account_id, customer_ref_id, customer_id, custom_tag_id, default_tag_id, created_at, created_by
+          account_id, customer_ref_id, customer_id, default_tag_id, created_at, created_by
         )
         SELECT DISTINCT
           stg.account_id, c.id AS customer_ref_id, stg.customer_id,
-          NULL::integer AS custom_tag_id, def.id AS default_tag_id, NOW(), -1
+          def.id AS default_tag_id, NOW(), -1
         FROM mt_customer_tags_details_dlk stg
         INNER JOIN mt_user_tags_details_dlk ut
           ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
