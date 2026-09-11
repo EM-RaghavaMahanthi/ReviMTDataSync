@@ -38,6 +38,14 @@ async def step_count_breakdown(account_id: str, engine) -> dict:
     a prediction of the insert rather than an upper bound, and splits the difference into
     named buckets instead of leaving it as an unexplained gap.
 
+    The NOT EXISTS guard is now a computed column rather than a WHERE clause, so rows already
+    assigned are counted instead of disappearing. `existing_records` and `already_exist_records`
+    used to be hardcoded 0 in the response, which made a run against an already-populated
+    account look like it had found almost nothing — the joined rows were filtered away before
+    anything counted them. joined_rows now partitions exactly:
+
+        joined_rows = already_exist + missing_customer + duplicate_rows_collapsed + ready
+
     DISTINCT is on (customer_ref_id, customer_id, default_tag_id) rather than
     (customer_id, default_tag_id) to match the insert exactly: account_id is constant, but
     customer_ref_id is NOT functionally determined by customer_id if
@@ -47,7 +55,12 @@ async def step_count_breakdown(account_id: str, engine) -> dict:
     with engine.begin() as conn:
         result = conn.execute(text(f"""
             WITH j AS (
-                SELECT stg.customer_id, def.id AS default_tag_id, c.id AS customer_ref_id
+                SELECT stg.customer_id, def.id AS default_tag_id, c.id AS customer_ref_id,
+                       EXISTS (
+                         SELECT 1 FROM {_ASSIGNMENTS_TABLE} a
+                         WHERE a.account_id = stg.account_id AND a.customer_id = stg.customer_id
+                           AND a.default_tag_id = def.id
+                       ) AS already_assigned
                 FROM mt_customer_tags_details_dlk stg
                 INNER JOIN mt_user_tags_details_dlk ut
                   ON stg.tag_id = ut.tag_id AND stg.account_id = ut.account_id
@@ -56,20 +69,20 @@ async def step_count_breakdown(account_id: str, engine) -> dict:
                 LEFT JOIN customers c
                   ON stg.customer_id = c.customer_id AND stg.account_id = c.account_id
                 WHERE stg.account_id = :account_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM {_ASSIGNMENTS_TABLE} a
-                    WHERE a.account_id = stg.account_id AND a.customer_id = stg.customer_id
-                      AND a.default_tag_id = def.id
-                  )
             )
             SELECT
-              COUNT(*) AS raw_rows,
-              COUNT(*) FILTER (WHERE customer_ref_id IS NULL) AS missing_customer,
+              (SELECT COUNT(*) FROM {_ASSIGNMENTS_TABLE} WHERE account_id = :account_id)
+                AS existing_in_main,
+              COUNT(*) AS joined_rows,
+              COUNT(*) FILTER (WHERE already_assigned) AS already_exist,
+              COUNT(*) FILTER (WHERE NOT already_assigned) AS raw_rows,
+              COUNT(*) FILTER (WHERE NOT already_assigned AND customer_ref_id IS NULL)
+                AS missing_customer,
               COUNT(DISTINCT (customer_ref_id, customer_id, default_tag_id))
-                FILTER (WHERE customer_ref_id IS NOT NULL) AS ready
+                FILTER (WHERE NOT already_assigned AND customer_ref_id IS NOT NULL) AS ready
             FROM j
         """), {"account_id": account_id})
-        raw_rows, missing_customer, ready = result.fetchone()
+        existing_in_main, joined_rows, already_exist, raw_rows, missing_customer, ready = result.fetchone()
 
     # Whatever survived the customers join but folded away under DISTINCT.
     collapsed = raw_rows - missing_customer - ready
@@ -84,6 +97,9 @@ async def step_count_breakdown(account_id: str, engine) -> dict:
             f"under DISTINCT (repeated customer_id/tag_id in mt_customer_tags_details_dlk)"
         )
     return {
+        "existing_in_main": existing_in_main,
+        "joined_rows": joined_rows,
+        "already_exist": already_exist,
         "raw_rows": raw_rows,
         "missing_customer": missing_customer,
         "duplicate_rows_collapsed": collapsed,
@@ -127,9 +143,11 @@ async def process_customer_tag_assignments(account_id: str, engine, write: bool 
         counts = await step_count_breakdown(account_id, engine)
         ready = counts["ready"]
         logger.info(
-            f"[process_customer_tag_assignments] staging={counts['raw_rows']} "
+            f"[process_customer_tag_assignments] joined={counts['joined_rows']} "
+            f"- already_exist={counts['already_exist']} "
             f"- missing_customer={counts['missing_customer']} "
-            f"- duplicate_collapsed={counts['duplicate_rows_collapsed']} = ready={ready}"
+            f"- duplicate_collapsed={counts['duplicate_rows_collapsed']} = ready={ready} "
+            f"(main table already holds {counts['existing_in_main']} for this account)"
         )
 
         if ready and not write:
@@ -156,9 +174,9 @@ async def process_customer_tag_assignments(account_id: str, engine, write: bool 
             # customer_tags_default, which run drop_staging_duplicates) — duplicates are
             # collapsed by the insert's DISTINCT instead, and counted separately below.
             "duplicates_removed": 0,
-            "total_records": counts["raw_rows"],
-            "existing_records": 0,
-            "already_exist_records": 0,
+            "total_records": counts["joined_rows"],
+            "existing_records": counts["existing_in_main"],
+            "already_exist_records": counts["already_exist"],
             "missing_customer_records": counts["missing_customer"],
             "duplicate_rows_collapsed": counts["duplicate_rows_collapsed"],
             "ready_to_insert": ready,
