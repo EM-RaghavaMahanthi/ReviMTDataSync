@@ -16,12 +16,19 @@ Required env var: DATABASE_URL
 Required for refresh_recent_notes only: API_KEY (MarianaTek bearer token)
 Optional env var: NOTES_WINDOW_HOURS (refresh_recent_notes only - default 24, see notes_recent.py)
 Optional env var: BACKFILL_WRITE_ENABLED (default FALSE - see _resolve_write below)
+Optional env vars: TEAMS_ENABLED + TEAMS_WEBHOOK_URL (notify_refresh_failures only)
 
 Event payload:
   { "event_type": "backfill_notes_and_tags", "account_id": 4809 }
   { "event_type": "refresh_recent_notes", "account_id": 4809 }
   optional on either: "write": true   (overrides BACKFILL_WRITE_ENABLED for this call)
   optional on refresh_recent_notes: "since": "2026-11-13T05:00:00Z"   (catch-up window start)
+
+  Run-level, no account_id: the refresh cron sends this once after its Map
+  (see step_functions/refresh_customer_notes_cron.asl.json):
+  { "event_type": "notify_refresh_failures", "execution_name": "...",
+    "results": [{"account_id": "83", "status": "FAILED", "error": "..."}, ...] }
+  or { "event_type": "notify_refresh_failures", "execution_name": "...", "stage0_error": "..." }
 """
 
 import os
@@ -72,6 +79,14 @@ async def async_lambda_handler(event, context=None):
 
     if not event_type:
         return {"status": "error", "error": "event_type is required"}
+
+    if event_type == "notify_refresh_failures":
+        # Imported here, not at module top: the account jobs never need the Teams client.
+        from notifiers.refresh_notifier import notify_refresh_failures
+        result = await notify_refresh_failures(
+            event.get("execution_name", "unknown"), event.get("results"), event.get("stage0_error")
+        )
+        return {"status": "success", "event_type": event_type, **result}
     if account_id is None:
         return {"status": "error", "error": "account_id is required"}
 

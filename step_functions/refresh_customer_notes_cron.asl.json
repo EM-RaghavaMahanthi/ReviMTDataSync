@@ -1,0 +1,237 @@
+{
+  "Comment": "Runs revi-backfill's refresh_recent_notes job for every account, one at a time (MaxConcurrency=1). Account list comes from revi-data-fixes-temp get_all_accounts_details; ExcludeAccounts then drops accounts that cannot succeed (account 1: MarianaTek returns 401). Every per-account outcome ends in a Pass state, never a Fail: ToleratedFailurePercentage is a DISTRIBUTED-Map field and is inert on this INLINE Map, so a failed iteration would abort the whole run. That means the execution always reports SUCCEEDED, so NotifyIfFailures (revi-backfill event_type=notify_refresh_failures) posts a Teams card whenever any account FAILED, and NotifyStage0Failed does the same if the account list cannot be loaded. A notify failure never fails the run. Source of truth: step_functions/refresh_customer_notes_cron.asl.json in ReviMTDataSync.",
+  "StartAt": "GetAccountsDetails",
+  "States": {
+    "GetAccountsDetails": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-data-fixes-temp",
+      "Parameters": {
+        "event_type": "get_all_accounts_details",
+        "account_ids.$": "$.accounts"
+      },
+      "ResultPath": "$.stage0_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "CheckStage0Status",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NotifyStage0Failed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "CheckStage0Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.stage0_result.status",
+          "StringEquals": "success",
+          "Next": "ExcludeAccounts"
+        }
+      ],
+      "Default": "NotifyStage0Failed"
+    },
+    "NotifyStage0Failed": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-backfill",
+      "Parameters": {
+        "event_type": "notify_refresh_failures",
+        "execution_name.$": "$$.Execution.Name",
+        "stage0_error.$": "States.JsonToString($)"
+      },
+      "ResultPath": "$.notify",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Stage0Failed",
+          "ResultPath": "$.notify_error"
+        }
+      ],
+      "Next": "Stage0Failed"
+    },
+    "Stage0Failed": {
+      "Type": "Fail",
+      "Error": "Stage0Failed",
+      "Cause": "Stage 0 failed - could not retrieve account details"
+    },
+    "ExcludeAccounts": {
+      "Type": "Pass",
+      "Comment": "Accounts left out of the refresh. account_id arrives as a STRING. 1 = bodybarpilates: MarianaTek returns 401 for its API key on every run; re-add once its credentials are fixed.",
+      "Parameters": {
+        "accounts.$": "$.stage0_result.data.accounts_details[?(@.account_id != '1')]"
+      },
+      "ResultPath": "$.to_refresh",
+      "Next": "ProcessAllAccounts"
+    },
+    "ProcessAllAccounts": {
+      "Type": "Map",
+      "MaxConcurrency": 1,
+      "ToleratedFailurePercentage": 100,
+      "ItemsPath": "$.to_refresh.accounts",
+      "ItemSelector": {
+        "account_id.$": "$$.Map.Item.Value.account_id"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "RefreshRecentNotes",
+        "States": {
+          "RefreshRecentNotes": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-backfill",
+            "Parameters": {
+              "event_type": "refresh_recent_notes",
+              "account_id.$": "$.account_id"
+            },
+            "ResultPath": "$.result",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "CheckAccountStatus",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "AccountErrored",
+                "ResultPath": "$.error"
+              }
+            ]
+          },
+          "CheckAccountStatus": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.result.status",
+                "StringEquals": "success",
+                "Next": "AccountSuccess"
+              }
+            ],
+            "Default": "AccountFailed"
+          },
+          "AccountFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "status": "FAILED",
+              "error.$": "States.JsonToString($.result)"
+            },
+            "End": true
+          },
+          "AccountSuccess": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "status": "SUCCESS",
+              "result.$": "$.result"
+            },
+            "End": true
+          },
+          "AccountErrored": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "status": "FAILED",
+              "error.$": "States.JsonToString($.error)"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "NotifyIfFailures",
+      "ResultPath": "$.results"
+    },
+    "NotifyIfFailures": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:491085429701:function:revi-backfill",
+      "Comment": "Posts to Teams only if some account FAILED; a clean run sends nothing.",
+      "Parameters": {
+        "event_type": "notify_refresh_failures",
+        "execution_name.$": "$$.Execution.Name",
+        "results.$": "$.results"
+      },
+      "ResultPath": "$.notify",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FinalSummary",
+          "ResultPath": "$.notify_error"
+        }
+      ],
+      "Next": "FinalSummary"
+    },
+    "FinalSummary": {
+      "Type": "Pass",
+      "Parameters": {
+        "workflow_status": "COMPLETED",
+        "execution_name.$": "$$.Execution.Name",
+        "accounts_processed.$": "States.ArrayLength($.results)",
+        "results.$": "$.results"
+      },
+      "End": true
+    }
+  }
+}
