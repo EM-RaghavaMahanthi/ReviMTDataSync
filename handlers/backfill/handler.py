@@ -21,6 +21,7 @@ Event payload:
   { "event_type": "backfill_notes_and_tags", "account_id": 4809 }
   { "event_type": "refresh_recent_notes", "account_id": 4809 }
   optional on either: "write": true   (overrides BACKFILL_WRITE_ENABLED for this call)
+  optional on refresh_recent_notes: "since": "2026-11-13T05:00:00Z"   (catch-up window start)
 """
 
 import os
@@ -98,7 +99,9 @@ async def async_lambda_handler(event, context=None):
     engine = create_engine(database_url)
 
     try:
-        result = await handler(account_id, engine, write=write)
+        # "since" is refresh_recent_notes-only (a catch-up window start); other jobs never see it.
+        extra = {"since": event["since"]} if event_type == "refresh_recent_notes" and event.get("since") else {}
+        result = await handler(account_id, engine, write=write, **extra)
         logger.info(f"[backfill] event_type={event_type} account_id={account_id} SUCCESS")
         return {"status": "success", "event_type": event_type, "account_id": account_id,
                 "write_enabled": write, **result}

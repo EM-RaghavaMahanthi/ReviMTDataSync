@@ -16,8 +16,19 @@ Window length: NOTES_WINDOW_HOURS env var, default 24 (temporary - drop back dow
 first run is evaluated). End is always "now" (UTC) at invocation time -
 min_note_datetime = now - NOTES_WINDOW_HOURS, max_note_datetime = now.
 
+Catch-up: an optional "since" (ISO-8601, UTC if no offset) replaces the window start for one
+call, so a gap after an outage can be refilled without changing NOTES_WINDOW_HOURS on the live
+function, which the 3-hourly cron also reads. Notes are not lost when a run fails, only unfetched:
+MarianaTek still has them, and the upsert is keyed on note_id, so overlapping windows are safe.
+
+Staging table: this job creates mt_user_notes_details_dlk itself if it is missing. It used to
+rely on Stage 2 (sql_cmds/create_staging_tables.sql) having left one behind, but Stage 2 only runs
+on onboarding. So when something else dropped the table (11-10 and 11-13), every refresh failed
+until the next onboarding happened to recreate it.
+
 Event payload:
   { "event_type": "refresh_recent_notes", "account_id": 4809 }
+  { "event_type": "refresh_recent_notes", "account_id": 4809, "since": "2026-11-13T05:00:00Z" }
 """
 
 import os
@@ -34,6 +45,48 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WINDOW_HOURS = 24  # TODO: drop back down after the first run is evaluated
 
 
+# Same columns as mt_user_notes_details_dlk in sql_cmds/create_staging_tables.sql, so whichever
+# side creates it, the other finds what it expects. Keep the two in step.
+_STAGING_DDL = """
+    CREATE TABLE IF NOT EXISTS "mt_user_notes_details_dlk" (
+      id integer,
+      account_id integer,
+      customer_id character varying(255),
+      customer_ref_id integer,
+      note_id character varying(64),
+      note text,
+      note_datetime timestamp(3) without time zone,
+      is_pinned boolean,
+      author_id character varying(255),
+      location integer,
+      created_at timestamp(3) without time zone,
+      created_by integer,
+      updated_at timestamp(3) without time zone,
+      updated_by integer,
+      deleted_at timestamp(3) without time zone,
+      deleted_by integer
+    )
+"""
+
+
+def _ensure_staging_table(engine) -> None:
+    # IF NOT EXISTS is not race-free in Postgres: two sessions creating at once can both pass
+    # the check and one fails on pg_type's unique index. The transaction-scoped advisory lock
+    # serialises creators. The cron runs accounts one at a time, but a manual catch-up may not.
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('mt_user_notes_details_dlk'))"))
+        conn.execute(text(_STAGING_DDL))
+
+
+def _parse_since(since: str, now: datetime) -> datetime:
+    dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if dt >= now:
+        raise ValueError(f"since={since} is not in the past")
+    return dt
+
+
 def _get_api_base_url(account_id: str, engine) -> str:
     with engine.begin() as conn:
         row = conn.execute(text("""
@@ -48,9 +101,18 @@ def _fmt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
+_PAGE_SIZE = 200  # same as core.config PAGE_SIZE; MT accepts up to 500
+
+
 async def _fetch_recent_notes(api_base_url: str, min_dt: datetime, max_dt: datetime) -> list:
-    """Paginate /user_notes filtered to [min_dt, max_dt]. Window is small by design, but
-    loop on links.next in case a busy tenant fills more than one page."""
+    """Paginate /user_notes filtered to [min_dt, max_dt].
+
+    /user_notes returns NO `links` block, only meta.pagination {count, pages, page,
+    per_page}. Stopping on a missing links.next therefore ended every run after page 1. With
+    MT's default per_page of 10, each run kept only the 10 newest notes in its window.
+    Follow meta.pagination.pages, still honour links.next if MT ever sends it, and stop on an
+    empty page either way.
+    """
     all_data = []
     page = 1
     while True:
@@ -58,13 +120,17 @@ async def _fetch_recent_notes(api_base_url: str, min_dt: datetime, max_dt: datet
             "min_note_datetime": _fmt(min_dt),
             "max_note_datetime": _fmt(max_dt),
             "page": page,
+            "page_size": _PAGE_SIZE,
         }
         resp = await api_get("/user_notes", api_base_url, params)
         data = resp.get("data", [])
         all_data.extend(data)
-        if not data or not (resp.get("links") or {}).get("next"):
+        pages = ((resp.get("meta") or {}).get("pagination") or {}).get("pages") or 0
+        has_next = bool((resp.get("links") or {}).get("next"))
+        if not data or not (has_next or page < pages):
             break
         page += 1
+    logger.info(f"[refresh_recent_notes] fetched {len(all_data)} notes across {page} page(s)")
     return all_data
 
 
@@ -97,11 +163,15 @@ async def _upsert_staging(rows: list, account_id: str, engine) -> dict:
     return {"staging_inserted": inserted, "staging_updated": updated}
 
 
-async def run(account_id: str, engine, write: bool = True) -> dict:
-    window_hours = int(os.environ.get("NOTES_WINDOW_HOURS", _DEFAULT_WINDOW_HOURS))
+async def run(account_id: str, engine, write: bool = True, since: str = None) -> dict:
     max_dt = datetime.now(timezone.utc)
-    min_dt = max_dt - timedelta(hours=window_hours)
+    if since:
+        min_dt = _parse_since(since, max_dt)
+    else:
+        window_hours = int(os.environ.get("NOTES_WINDOW_HOURS", _DEFAULT_WINDOW_HOURS))
+        min_dt = max_dt - timedelta(hours=window_hours)
 
+    _ensure_staging_table(engine)
     api_base_url = _get_api_base_url(account_id, engine)
     logger.info(
         f"[refresh_recent_notes] account_id={account_id}: window={min_dt.isoformat()}..{max_dt.isoformat()}"
