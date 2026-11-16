@@ -25,14 +25,20 @@
 set -euo pipefail
 
 LAMBDA_NAME="${LAMBDA_NAME:-revi-backfill}"
-AWS_PROFILE="${AWS_PROFILE:-revi}"
+# Pinned to revi: an ambient AWS_PROFILE (e.g. emc_sso) is a different account. Override with REVI_AWS_PROFILE.
+AWS_PROFILE="${REVI_AWS_PROFILE:-revi}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+# The only account this Lambda may be deployed to. The role, layers and VPC below are all
+# this account's resources, so a deploy anywhere else is a mistake.
+EXPECTED_ACCOUNT_ID="${EXPECTED_ACCOUNT_ID:-491085429701}"
 ZIP_NAME="backfill_handler_deploy.zip"
 BUILD_DIR="backfill_handler_build"
 # backfill_notes_and_tags is Stage-3-only (pure SQLAlchemy, no CRM calls). refresh_recent_notes
 # calls the live MarianaTek API via utils.api_client (rate-limited/retried, same as Stage 1)
 # and reuses crm_sync.user_notes's row mapper (pulls in schemas.revi_schema) - so crm_sync,
 # utils, and schemas need to be bundled too, even though the other job doesn't use them.
-SOURCE_DIRS=("core" "handlers" "stg_db_services" "crm_sync" "utils" "schemas")
+# notifiers: the refresh cron's failure alert (event_type=notify_refresh_failures).
+SOURCE_DIRS=("core" "handlers" "stg_db_services" "crm_sync" "utils" "schemas" "notifiers")
 
 # ── First-create-only config — reused from revi-data-sync-stg-to-db (same DB/VPC access
 # needs; only used if the function doesn't exist yet). Lighter memory/timeout than that
@@ -60,11 +66,27 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 export AWS_PROFILE="$AWS_PROFILE"
+export AWS_REGION="$AWS_REGION"
+
+# Right account, working credentials, or stop. Nothing below may run on a guess.
+CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>&1)" \
+    || error "AWS credentials for profile '$AWS_PROFILE' are not usable (expired SSO? run 'aws sso login --profile $AWS_PROFILE'): $CALLER_ACCOUNT"
+[ "$CALLER_ACCOUNT" = "$EXPECTED_ACCOUNT_ID" ] \
+    || error "Profile '$AWS_PROFILE' is account $CALLER_ACCOUNT, not $EXPECTED_ACCOUNT_ID — refusing to deploy."
 
 # Probe the function BEFORE resolving secrets: on an update we can reuse whatever is already
 # set on it, so a redeploy needs no local .env and no connection string on the command line.
-FUNCTION_EXISTS=true
-aws lambda get-function --function-name "$LAMBDA_NAME" > /dev/null 2>&1 || FUNCTION_EXISTS=false
+#
+# Only ResourceNotFoundException means "create it". This used to treat ANY failure as absent,
+# so an expired SSO token sent a deploy of the existing function down the create path
+# (11-16). Every other error stops here.
+if GET_ERR="$(aws lambda get-function --function-name "$LAMBDA_NAME" 2>&1 >/dev/null)"; then
+    FUNCTION_EXISTS=true
+elif echo "$GET_ERR" | grep -q "ResourceNotFoundException"; then
+    FUNCTION_EXISTS=false
+else
+    error "Could not check whether $LAMBDA_NAME exists — not deploying: $GET_ERR"
+fi
 
 CURRENT_ENV='{}'
 if [ "$FUNCTION_EXISTS" = true ]; then
@@ -143,6 +165,15 @@ BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-$(dotenv_var BACKFILL_WRITE_EN
 BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-$(current_env_var BACKFILL_WRITE_ENABLED)}"
 BACKFILL_WRITE_ENABLED="${BACKFILL_WRITE_ENABLED:-false}"
 
+# Teams alert for the refresh cron (notifiers/refresh_notifier.py). Same resolution as API_KEY:
+# shell > .env > whatever is already on the function. TEAMS_ENABLED follows the URL, because
+# a separate flag that can disagree with it is one more way to be silently off. No URL means
+# the alert is off and failures are only logged.
+TEAMS_WEBHOOK_URL="${TEAMS_WEBHOOK_URL:-$(dotenv_var TEAMS_WEBHOOK_URL)}"
+TEAMS_WEBHOOK_URL="${TEAMS_WEBHOOK_URL:-$(current_env_var TEAMS_WEBHOOK_URL)}"
+if [ -n "$TEAMS_WEBHOOK_URL" ]; then TEAMS_ENABLED=true; else TEAMS_ENABLED=false
+    info "TEAMS_WEBHOOK_URL not set anywhere — refresh failure alerts stay off."; fi
+
 info "Cleaning old artifacts..."
 rm -rf "$BUILD_DIR" "$ZIP_NAME"
 mkdir -p "$BUILD_DIR"
@@ -168,8 +199,11 @@ if [ "$FUNCTION_EXISTS" = false ]; then
         --arg key "$API_KEY" \
         --arg win "$NOTES_WINDOW_HOURS" \
         --arg wr "$BACKFILL_WRITE_ENABLED" \
-        '{Variables: ({DATABASE_URL: $db, BACKFILL_WRITE_ENABLED: $wr}
+        --arg tu "$TEAMS_WEBHOOK_URL" \
+        --arg te "$TEAMS_ENABLED" \
+        '{Variables: ({DATABASE_URL: $db, BACKFILL_WRITE_ENABLED: $wr, TEAMS_ENABLED: $te}
             + (if $key != "" then {API_KEY: $key} else {} end)
+            + (if $tu != "" then {TEAMS_WEBHOOK_URL: $tu} else {} end)
             + (if $win != "" then {NOTES_WINDOW_HOURS: $win} else {} end))}')"
 
     aws lambda create-function \
@@ -212,8 +246,11 @@ ENV_JSON="$(echo "$CURRENT_ENV" | jq -c \
     --arg key "$API_KEY" \
     --arg win "$NOTES_WINDOW_HOURS" \
     --arg wr "$BACKFILL_WRITE_ENABLED" \
-    '{Variables: (. + {DATABASE_URL: $db, BACKFILL_WRITE_ENABLED: $wr}
+    --arg tu "$TEAMS_WEBHOOK_URL" \
+    --arg te "$TEAMS_ENABLED" \
+    '{Variables: (. + {DATABASE_URL: $db, BACKFILL_WRITE_ENABLED: $wr, TEAMS_ENABLED: $te}
         + (if $key != "" then {API_KEY: $key} else {} end)
+        + (if $tu != "" then {TEAMS_WEBHOOK_URL: $tu} else {} end)
         + (if $win != "" then {NOTES_WINDOW_HOURS: $win} else {} end))}')"
 
 info "Setting handler + environment..."
@@ -226,6 +263,6 @@ aws lambda update-function-configuration \
 
 info "Waiting for configuration update to complete..."
 aws lambda wait function-updated --function-name "$LAMBDA_NAME" \
-    && success "Done — $LAMBDA_NAME updated (handler + DATABASE_URL + API_KEY + NOTES_WINDOW_HOURS=$NOTES_WINDOW_HOURS + BACKFILL_WRITE_ENABLED=$BACKFILL_WRITE_ENABLED)."
+    && success "Done — $LAMBDA_NAME updated (handler + DATABASE_URL + API_KEY + NOTES_WINDOW_HOURS=$NOTES_WINDOW_HOURS + BACKFILL_WRITE_ENABLED=$BACKFILL_WRITE_ENABLED + TEAMS_ENABLED=$TEAMS_ENABLED)."
 
 rm -rf "$BUILD_DIR" "$ZIP_NAME"

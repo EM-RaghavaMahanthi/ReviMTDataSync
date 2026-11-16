@@ -15,11 +15,11 @@
 # that already grants S3 Tables, Athena, Glue and Lake Formation. See LAMBDA_ROLE_ARN
 # below. The reference function's own role has none of that.
 #
-# Credentials come from the ambient AWS environment — export AWS_PROFILE (or
-# AWS_ACCESS_KEY_ID/…) yourself before running.
+# Credentials: profile revi (pinned; ambient AWS_PROFILE is ignored), or AWS_ACCESS_KEY_ID/… (which
+# the CLI prefers over any profile). The account is checked before anything is deployed.
 #
 # Usage (run from repo root):
-#   export AWS_PROFILE=revi
+#   (profile is pinned to revi — set REVI_AWS_PROFILE to override)
 #   ./deployments/deploy_s3_to_stg_bulk.sh
 #   ATHENA_OUTPUT_BUCKET=revi-datalake-athena ATHENA_OUTPUT_PREFIX=temp ./deployments/deploy_s3_to_stg_bulk.sh
 #   LAMBDA_NAME=other-function REFERENCE_LAMBDA=revi-data-sync-stg-to-db ./deployments/deploy_s3_to_stg_bulk.sh
@@ -79,6 +79,16 @@ cd "$REPO_ROOT"
 
 command -v jq >/dev/null 2>&1 || error "jq is required — install it or set the configuration manually."
 
+# Right account, working credentials, or stop — this script can CREATE a function, and the
+# role ARN it would attach is this account's. Profile defaults to revi like the other scripts.
+export AWS_PROFILE="${REVI_AWS_PROFILE:-revi}"  # pinned; ambient AWS_PROFILE may be another account
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+EXPECTED_ACCOUNT_ID="${EXPECTED_ACCOUNT_ID:-491085429701}"
+CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>&1)" \
+    || error "AWS credentials for profile '$AWS_PROFILE' are not usable (expired SSO? run 'aws sso login --profile $AWS_PROFILE'): $CALLER_ACCOUNT"
+[ "$CALLER_ACCOUNT" = "$EXPECTED_ACCOUNT_ID" ] \
+    || error "Profile '$AWS_PROFILE' is account $CALLER_ACCOUNT, not $EXPECTED_ACCOUNT_ID — refusing to deploy."
+
 # ── Package ─────────────────────────────────────────────────────────────────
 
 info "Cleaning old artifacts..."
@@ -125,11 +135,15 @@ info "  role=$LAMBDA_ROLE_ARN"
 
 FUNCTION_EXISTS=0
 CURRENT_ENV='{}'
-if aws lambda get-function-configuration --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
+# Only ResourceNotFoundException means "create it" — an auth or throttling error used to land
+# on the create path too. Anything else stops the deploy.
+if GET_ERR="$(aws lambda get-function-configuration --function-name "$LAMBDA_NAME" 2>&1 >/dev/null)"; then
     FUNCTION_EXISTS=1
     CURRENT_ENV="$(aws lambda get-function-configuration \
         --function-name "$LAMBDA_NAME" --query 'Environment.Variables' --output json)"
     [ "$CURRENT_ENV" = "null" ] && CURRENT_ENV='{}'
+elif ! echo "$GET_ERR" | grep -q "ResourceNotFoundException"; then
+    error "Could not check whether $LAMBDA_NAME exists — not deploying: $GET_ERR"
 else
     # First deploy: seed DATABASE_URL from the reference so the new function points at the
     # same RDS instance the rest of the pipeline uses. Override by exporting DATABASE_URL.

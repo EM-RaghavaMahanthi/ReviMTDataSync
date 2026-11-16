@@ -9,7 +9,8 @@
 set -euo pipefail
 
 LAMBDA_NAME="${LAMBDA_NAME:-revi-crm-db-sync}"
-AWS_PROFILE="${AWS_PROFILE:-revi}"
+# Pinned to revi: an ambient AWS_PROFILE (e.g. emc_sso) is a different account. Override with REVI_AWS_PROFILE.
+AWS_PROFILE="${REVI_AWS_PROFILE:-revi}"
 ZIP_NAME="s3_to_db_deploy.zip"
 BUILD_DIR="s3_to_db_build"
 SOURCE_DIRS=("core" "clients" "handlers" "db_services" "schemas" "utils" "sql_cmds")

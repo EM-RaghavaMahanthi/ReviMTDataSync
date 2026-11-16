@@ -9,7 +9,8 @@
 set -euo pipefail
 
 LAMBDA_NAME="${LAMBDA_NAME:-revi-data-sync-stg-to-db}"
-AWS_PROFILE="${AWS_PROFILE:-revi}"
+# Pinned to revi: an ambient AWS_PROFILE (e.g. emc_sso) is a different account. Override with REVI_AWS_PROFILE.
+AWS_PROFILE="${REVI_AWS_PROFILE:-revi}"
 ZIP_NAME="stg_to_main_deploy.zip"
 BUILD_DIR="stg_to_main_build"
 SOURCE_DIRS=("core" "clients" "handlers" "stg_db_services")
